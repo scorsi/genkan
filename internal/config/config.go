@@ -241,7 +241,6 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 				if r.Backend != "" {
 					bad("%s: backend is only for http and tcp routes", where)
 				}
-				bad("%s: static routes not implemented before v0.3", where)
 			}
 		case "tcp":
 			names = r.SNI

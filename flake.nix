@@ -32,7 +32,8 @@
       nixosModules.default = import ./nix/module.nix self;
 
       # The package's check phase runs `go vet` and `go test` (nix/package.nix). On Linux, the
-      # module builds the validated TOML of nix/example.nix, and a typo in it fails the build.
+      # module builds the validated TOML of nix/example.nix, a typo in it fails the build, and the
+      # VM test of nix/vm-test.nix runs (needs a Linux builder: Forgejo CI).
       checks = forAllSystems (
         system:
         let
@@ -55,6 +56,7 @@
           module-typo = (pkgsFor system).testers.testBuildFailure (moduleConfig {
             services.genkan.settings.log.levle = "info";
           });
+          vm = import ./nix/vm-test.nix self { pkgs = pkgsFor system; };
         }
       );
 

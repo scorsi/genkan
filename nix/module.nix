@@ -70,14 +70,27 @@ let
         { inherit (c) cert key; }
     ) cfg.certificates;
 
-    routes = lib.mapAttrsToList (host: site: {
-      name = host;
-      type = "http";
-      listeners = if site.listeners != null then site.listeners else lib.attrNames cfg.listeners;
-      hosts = [ host ];
-      certificate = certFor host site;
-      inherit (site) backend;
-    }) cfg.sites;
+    routes = lib.mapAttrsToList (
+      host: site:
+      {
+        name = host;
+        listeners = if site.listeners != null then site.listeners else lib.attrNames cfg.listeners;
+        hosts = [ host ];
+        certificate = certFor host site;
+      }
+      // (
+        if site.root != null then
+          {
+            type = "static";
+            root = "${site.root}"; # a Nix path or package lands in the store
+          }
+        else
+          {
+            type = "http";
+            inherit (site) backend;
+          }
+      )
+    ) cfg.sites;
   };
 
   # `genkan validate` at build time: an invalid config never becomes a system (ADR 0003).
@@ -155,9 +168,19 @@ in
         types.submodule {
           options = {
             backend = mkOption {
-              type = types.str;
+              type = types.nullOr types.str;
+              default = null;
               example = "http://127.0.0.1:3000";
-              description = "`http://host:port` the requests are forwarded to.";
+              description = "`http://host:port` the requests are forwarded to. Exclusive with `root`.";
+            };
+            root = mkOption {
+              type = types.nullOr types.path;
+              default = null;
+              example = lib.literalExpression "pkgs.my-site";
+              description = ''
+                Absolute directory (or a package) served as static files: `index.html` for a directory, 404
+                otherwise, no listing. Must be readable by the `genkan` user. Exclusive with `backend`.
+              '';
             };
             listeners = mkOption {
               type = types.nullOr (types.listOf types.str);
@@ -173,7 +196,7 @@ in
         }
       );
       default = { };
-      description = "HTTP sites, by hostname.";
+      description = "Sites, by hostname: an HTTP backend or a static root.";
     };
 
     settings = mkOption {
@@ -187,10 +210,15 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = lib.mapAttrsToList (name: c: {
-      assertion = (c.useACMEHost != null) != (c.cert != null && c.key != null);
-      message = "services.genkan.certificates.${name}: set either useACMEHost or both cert and key.";
-    }) cfg.certificates;
+    assertions =
+      lib.mapAttrsToList (name: c: {
+        assertion = (c.useACMEHost != null) != (c.cert != null && c.key != null);
+        message = "services.genkan.certificates.${name}: set either useACMEHost or both cert and key.";
+      }) cfg.certificates
+      ++ lib.mapAttrsToList (host: site: {
+        assertion = (site.backend != null) != (site.root != null);
+        message = "services.genkan.sites.\"${host}\": set exactly one of backend and root.";
+      }) cfg.sites;
 
     services.genkan.settings = {
       log = lib.mapAttrs (_: lib.mkDefault) {

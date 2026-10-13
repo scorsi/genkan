@@ -62,7 +62,8 @@ func TestInvalid(t *testing.T) {
 		{"https backend", strings.Replace(valid, `http://127.0.0.1:3000`, `https://127.0.0.1:3000`, 1), "must be an http:// URL"},
 		{"backend with path", strings.Replace(valid, `http://127.0.0.1:3000`, `http://127.0.0.1:3000/api`, 1), "no path, query or userinfo"},
 		{"send_proxy on http", valid + "send_proxy = \"v2\"\n", "send_proxy is only for tcp routes"},
-		{"static", strings.Replace(strings.Replace(valid, `type = "http"`, `type = "static"`, 1), `backend = "http://127.0.0.1:3000"`, `root = "/var/www"`, 1), "static routes not implemented before v0.3"},
+		{"static with backend", strings.Replace(valid, `type = "http"`, "type = \"static\"\nroot = \"/var/www\"", 1), "backend is only for http and tcp routes"},
+		{"http with root", valid + "root = \"/var/www\"\n", "root is only for static routes"},
 		{"static relative root", strings.Replace(strings.Replace(valid, `type = "http"`, `type = "static"`, 1), `backend = "http://127.0.0.1:3000"`, `root = "www"`, 1), "must be an absolute path"},
 		{"tcp route", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\n", "tcp routes not implemented before v1"},
 		{"tcp route without sni on tls", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nbackend = \"127.0.0.1:22\"\n", "sni is required on tls listeners"},
@@ -92,6 +93,17 @@ func TestInvalid(t *testing.T) {
 				t.Fatalf("got %q, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidStatic(t *testing.T) {
+	static := strings.Replace(strings.Replace(valid, `type = "http"`, `type = "static"`, 1), `backend = "http://127.0.0.1:3000"`, `root = "/var/www"`, 1)
+	c, err := Parse(strings.NewReader(static))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs, warns := c.Validate(); len(errs) > 0 || len(warns) > 0 {
+		t.Errorf("errs=%v warns=%v", errs, warns)
 	}
 }
 

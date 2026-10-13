@@ -139,11 +139,17 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 		if !slices.Contains(r.Listeners, listener) {
 			continue
 		}
-		backend, err := url.Parse(r.Backend)
-		if err != nil {
-			return nil, fmt.Errorf("route %q: %w", r.Name, err)
+		var h http.Handler
+		switch r.Type {
+		case "http":
+			backend, err := url.Parse(r.Backend)
+			if err != nil {
+				return nil, fmt.Errorf("route %q: %w", r.Name, err)
+			}
+			h = router.Proxy(backend, s.log)
+		case "static":
+			h = router.Static(r.Root)
 		}
-		h := router.Proxy(backend, s.log)
 		for _, host := range r.Hosts {
 			st.rt.Handle(host, r.Name, h)
 			st.hosts[host] = certs[r.Certificate]

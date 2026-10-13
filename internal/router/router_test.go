@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +128,46 @@ func TestProgressDeadline(t *testing.T) {
 	}
 	if body, err := send(0, 5); err == nil && body == "10" {
 		t.Error("stalled body was accepted")
+	}
+}
+
+func TestStatic(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, body string) {
+		p := filepath.Join(root, name)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("index.html", "home")
+	write("a.css", "css")
+	write("docs/index.html", "docs")
+	write("bare/x.txt", "x")
+	write("../secret", "secret")
+	h := Static(root)
+
+	tests := []struct {
+		path, want string
+		status     int
+	}{
+		{"/", "home", 200},
+		{"/a.css", "css", 200},
+		{"/docs/", "docs", 200},
+		{"/docs", "", 301},
+		{"/bare/", "404 page not found\n", 404},
+		{"/bare", "404 page not found\n", 404},
+		{"/bare/x.txt", "x", 200},
+		{"/missing", "404 page not found\n", 404},
+		{"/missing/", "404 page not found\n", 404},
+		{"/../secret", "404 page not found\n", 404},
+	}
+	for _, tt := range tests {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "http://s.example"+tt.path, nil))
+		if rec.Code != tt.status || (tt.want != "" && rec.Body.String() != tt.want) {
+			t.Errorf("%s: got %d %q, want %d %q", tt.path, rec.Code, rec.Body, tt.status, tt.want)
+		}
 	}
 }
 

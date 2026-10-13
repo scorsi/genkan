@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -95,6 +96,31 @@ func Proxy(backend *url.URL, log *slog.Logger) http.Handler {
 		Transport: transport,
 		ErrorLog:  slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
+}
+
+// Static serves the files under root: index.html for a directory, 404 for a directory without one
+// (no listing) and for anything missing. No SPA fallback.
+func Static(root string) http.Handler {
+	return http.FileServer(noListing{http.Dir(root)})
+}
+
+// noListing hides directories that have no index.html, so http.FileServer never lists them.
+type noListing struct{ fs http.FileSystem }
+
+func (n noListing) Open(name string) (http.File, error) {
+	f, err := n.fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if st, err := f.Stat(); err == nil && st.IsDir() {
+		index, err := n.fs.Open(path.Join(name, "index.html"))
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		index.Close()
+	}
+	return f, nil
 }
 
 func hostOnly(hostport string) string {
