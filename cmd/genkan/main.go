@@ -17,7 +17,7 @@ const usage = `usage: genkan <command> <config.toml>
 
 commands:
   validate  check the config and exit
-  run       serve the config until SIGTERM
+  run       serve the config until SIGTERM, re-read it on SIGHUP
 `
 
 func main() {
@@ -37,12 +37,12 @@ func main() {
 		return
 	}
 
-	var level slog.Level
+	level := new(slog.LevelVar) // a reload may change it
 	level.UnmarshalText([]byte(cfg.Log.Level))
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := serve.Run(ctx, cfg, log); err != nil {
+	if err := serve.Run(ctx, os.Args[2], cfg, log, level); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}

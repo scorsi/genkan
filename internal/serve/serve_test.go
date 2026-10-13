@@ -31,10 +31,11 @@ func selfSigned(t *testing.T, host string) *tls.Certificate {
 }
 
 func TestSNISelection(t *testing.T) {
-	cfg := TLSConfig(map[string]*tls.Certificate{
+	hosts := map[string]*tls.Certificate{
 		"a.example": selfSigned(t, "a.example"),
 		"b.example": selfSigned(t, "b.example"),
-	})
+	}
+	cfg := TLSConfig(func() map[string]*tls.Certificate { return hosts })
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
 	if err != nil {
 		t.Fatal(err)

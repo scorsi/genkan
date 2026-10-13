@@ -29,10 +29,34 @@
         default = (pkgsFor system).callPackage ./nix/package.nix { inherit src; };
       });
 
-      # The package's check phase runs `go vet` and `go test` (nix/package.nix).
-      checks = forAllSystems (system: {
-        default = self.packages.${system}.default;
-      });
+      nixosModules.default = import ./nix/module.nix self;
+
+      # The package's check phase runs `go vet` and `go test` (nix/package.nix). On Linux, the
+      # module builds the validated TOML of nix/example.nix, and a typo in it fails the build.
+      checks = forAllSystems (
+        system:
+        let
+          moduleConfig =
+            extra:
+            (lib.nixosSystem {
+              modules = [
+                self.nixosModules.default
+                ./nix/example.nix
+                extra
+                { nixpkgs.hostPlatform = system; }
+              ];
+            }).config.environment.etc."genkan/genkan.toml".source;
+        in
+        {
+          default = self.packages.${system}.default;
+        }
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          module = moduleConfig { };
+          module-typo = (pkgsFor system).testers.testBuildFailure (moduleConfig {
+            services.genkan.settings.log.levle = "info";
+          });
+        }
+      );
 
       devShells = forAllSystems (
         system:
