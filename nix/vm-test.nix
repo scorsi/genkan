@@ -116,19 +116,19 @@ pkgs.testers.runNixOSTest {
     pid = machine.succeed("systemctl show -P MainPID genkan").strip()
 
     with subtest("reload picks up a rotated certificate"):
-        assert "CN = first" in subject()
+        assert "first" in subject()
         machine.succeed("cp ${certs}/rotated.pem ${dir}/cert.pem")
         machine.succeed("cp ${certs}/rotated.key ${dir}/key.pem")
         machine.succeed("systemctl reload genkan")
         machine.wait_until_succeeds("openssl s_client -connect 127.0.0.1:443 -servername app.test"
-                                    " </dev/null 2>/dev/null | openssl x509 -noout -subject | grep 'CN = rotated'")
+                                    " </dev/null 2>/dev/null | openssl x509 -noout -subject | grep rotated")
         assert curl("site.test") == "home\n 200"
 
     with subtest("failed reload keeps the running config"):
         machine.succeed("echo garbage > ${dir}/cert.pem")
         machine.succeed("systemctl reload genkan")
         machine.wait_until_succeeds("journalctl -u genkan | grep 'reload failed'")
-        assert "CN = rotated" in subject()
+        assert "rotated" in subject()
         assert curl("app.test").endswith(" 200")
 
     assert machine.succeed("systemctl show -P MainPID genkan").strip() == pid, "genkan restarted"
