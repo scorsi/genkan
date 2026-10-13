@@ -35,7 +35,7 @@ with structured access logs. No reload: restart to apply config.
   timeout, per-listener connection cap.
 - Access log: one slog JSON record per request (time, listener, route,
   client IP, method, host, path, status, bytes, duration, user agent).
-- `docs/config.md` describes every key.
+- `docs/config.md` describes every key (written during design, kept in sync).
 
 Acceptance: unit tests cover validation errors, host routing, header
 overwriting, preservation of the inbound `Host` on the backend request
