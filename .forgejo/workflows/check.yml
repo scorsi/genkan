@@ -1,0 +1,11 @@
+# Unit tests and vet on every push, on the Linux runner (the NixOS VM test joins here in v0.3).
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: linux
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: nix flake check --print-build-logs
