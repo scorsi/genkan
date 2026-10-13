@@ -2,28 +2,48 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/serve"
 )
 
 const usage = `usage: genkan <command> <config.toml>
 
 commands:
   validate  check the config and exit
-  run       serve the config until SIGTERM; SIGHUP reloads it
+  run       serve the config until SIGTERM
 `
 
 func main() {
-	if len(os.Args) != 3 {
+	if len(os.Args) != 3 || (os.Args[1] != "validate" && os.Args[1] != "run") {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	switch os.Args[1] {
-	case "validate", "run":
-		fmt.Fprintf(os.Stderr, "genkan %s: not implemented\n", os.Args[1])
+	cfg, warnings, err := config.Load(os.Args[2])
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
-	default:
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+	}
+	if os.Args[1] == "validate" {
+		return
+	}
+
+	var level slog.Level
+	level.UnmarshalText([]byte(cfg.Log.Level))
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := serve.Run(ctx, cfg, log); err != nil {
+		log.Error("fatal", "err", err)
+		os.Exit(1)
 	}
 }

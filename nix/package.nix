@@ -8,8 +8,8 @@ buildGoModule {
   version = "0.1.0-dev";
   inherit src;
 
-  # No external module yet: set to a real hash once go.sum exists (ADR 0005).
-  vendorHash = null;
+  # Changes whenever go.sum does: set to lib.fakeHash and read the new value from the build error.
+  vendorHash = "sha256-2FTMhWgivUY7En7W6ktuBcyDwbTHbpKZnPZWXBgC4i0=";
 
   ldflags = [
     "-s"
