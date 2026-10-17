@@ -41,7 +41,7 @@ let
     HTTPServer(("127.0.0.1", 8080), Echo).serve_forever()
   '';
 
-  dir = "/var/lib/genkan-certs";
+  dir = "/var/lib/hanko/test"; # where hanko writes, group per certificate
 in
 pkgs.testers.runNixOSTest {
   name = "genkan";
@@ -55,11 +55,14 @@ pkgs.testers.runNixOSTest {
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${backend}";
     };
 
-    # Copied out of the store so the test can rotate them.
+    # hanko's module declares this group; here the test stands in for hanko and copies the
+    # files out of the store so it can rotate them.
+    users.groups.hanko = { };
     systemd.tmpfiles.rules = [
-      "d ${dir} 0755 root root -"
-      "C ${dir}/cert.pem 0644 root root - ${certs}/first.pem"
-      "C ${dir}/key.pem 0640 root genkan - ${certs}/first.key"
+      "d /var/lib/hanko 0755 root root -"
+      "d ${dir} 2750 root hanko -"
+      "C ${dir}/fullchain.pem 0640 root hanko - ${certs}/first.pem"
+      "C ${dir}/key.pem 0640 root hanko - ${certs}/first.key"
     ];
 
     services.genkan = {
@@ -69,7 +72,7 @@ pkgs.testers.runNixOSTest {
           "app.test"
           "site.test"
         ];
-        cert = "${dir}/cert.pem";
+        cert = "${dir}/fullchain.pem";
         key = "${dir}/key.pem";
       };
       sites."app.test".backend = "http://127.0.0.1:8080";
@@ -117,7 +120,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("reload picks up a rotated certificate"):
         assert "first" in subject()
-        machine.succeed("cp ${certs}/rotated.pem ${dir}/cert.pem")
+        machine.succeed("cp ${certs}/rotated.pem ${dir}/fullchain.pem")
         machine.succeed("cp ${certs}/rotated.key ${dir}/key.pem")
         machine.succeed("systemctl reload genkan")
         machine.wait_until_succeeds("openssl s_client -connect 127.0.0.1:443 -servername app.test"
@@ -125,7 +128,7 @@ pkgs.testers.runNixOSTest {
         assert curl("site.test") == "home\n 200"
 
     with subtest("failed reload keeps the running config"):
-        machine.succeed("echo garbage > ${dir}/cert.pem")
+        machine.succeed("echo garbage > ${dir}/fullchain.pem")
         machine.succeed("systemctl reload genkan")
         machine.wait_until_succeeds("journalctl -u genkan | grep 'reload failed'")
         assert "rotated" in subject()

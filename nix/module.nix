@@ -14,21 +14,6 @@ let
   exe = lib.getExe cfg.package;
   path = "/etc/genkan/genkan.toml";
 
-  acmeHosts = lib.unique (
-    lib.filter (h: h != null) (lib.mapAttrsToList (_: c: c.useACMEHost) cfg.certificates)
-  );
-
-  # Hosts a certificate covers: declared, or the names security.acme issues it for.
-  certHosts =
-    c:
-    if c.useACMEHost != null then
-      let
-        acme = config.security.acme.certs.${c.useACMEHost};
-      in
-      [ acme.domain ] ++ acme.extraDomainNames
-    else
-      c.hosts;
-
   # Certificate for a site: exact name first, then a wildcard on the first label.
   certFor =
     host: site:
@@ -37,9 +22,7 @@ let
       wildcard = lib.concatStringsSep "." ([ "*" ] ++ lib.tail parts);
       find =
         name:
-        lib.findFirst (n: lib.elem name (certHosts cfg.certificates.${n})) null (
-          lib.attrNames cfg.certificates
-        );
+        lib.findFirst (n: lib.elem name cfg.certificates.${n}.hosts) null (lib.attrNames cfg.certificates);
       found = if find host != null then find host else find wildcard;
     in
     if site.certificate != null then
@@ -56,19 +39,7 @@ let
       mode = "tls";
     }) cfg.listeners;
 
-    certificates = lib.mapAttrs (
-      _: c:
-      if c.useACMEHost != null then
-        let
-          dir = config.security.acme.certs.${c.useACMEHost}.directory;
-        in
-        {
-          cert = "${dir}/fullchain.pem";
-          key = "${dir}/key.pem";
-        }
-      else
-        { inherit (c) cert key; }
-    ) cfg.certificates;
+    certificates = lib.mapAttrs (_: c: { inherit (c) cert key; }) cfg.certificates;
 
     routes = lib.mapAttrsToList (
       host: site:
@@ -132,29 +103,20 @@ in
       type = types.attrsOf (
         types.submodule {
           options = {
-            useACMEHost = mkOption {
-              type = types.nullOr types.str;
-              default = null;
-              description = ''
-                A `security.acme.certs` entry. Its domain and extra domain names give the hosts it
-                covers, genkan joins the `acme` group, and the certificate reloads genkan on renewal.
-              '';
-            };
             hosts = mkOption {
               type = types.listOf types.str;
-              default = [ ];
               example = [ "*.home.example.org" ];
-              description = "Hosts this certificate covers, when it does not come from `useACMEHost`.";
+              description = "Hosts this certificate covers; sites are matched to it by host.";
             };
             cert = mkOption {
-              type = types.nullOr types.str;
-              default = null;
-              description = "Path to the PEM certificate chain (a sops secret path, never a value).";
+              type = types.str;
+              example = "/var/lib/hanko/home/fullchain.pem";
+              description = "Path to the PEM certificate chain, leaf first (written by hanko, or a sops secret path).";
             };
             key = mkOption {
-              type = types.nullOr types.str;
-              default = null;
-              description = "Path to the PEM private key (a sops secret path, never a value).";
+              type = types.str;
+              example = "/var/lib/hanko/home/key.pem";
+              description = "Path to the PEM private key (written by hanko, or a sops secret path, never a value).";
             };
           };
         }
@@ -210,15 +172,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions =
-      lib.mapAttrsToList (name: c: {
-        assertion = (c.useACMEHost != null) != (c.cert != null && c.key != null);
-        message = "services.genkan.certificates.${name}: set either useACMEHost or both cert and key.";
-      }) cfg.certificates
-      ++ lib.mapAttrsToList (host: site: {
-        assertion = (site.backend != null) != (site.root != null);
-        message = "services.genkan.sites.\"${host}\": set exactly one of backend and root.";
-      }) cfg.sites;
+    assertions = lib.mapAttrsToList (host: site: {
+      assertion = (site.backend != null) != (site.root != null);
+      message = "services.genkan.sites.\"${host}\": set exactly one of backend and root.";
+    }) cfg.sites;
 
     services.genkan.settings = {
       log = lib.mapAttrs (_: lib.mkDefault) {
@@ -236,15 +193,11 @@ in
     };
     users.groups.genkan = { };
 
-    security.acme.certs = lib.genAttrs acmeHosts (_: {
-      reloadServices = [ "genkan.service" ];
-    });
-
     systemd.services.genkan = {
       description = "genkan reverse proxy";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ] ++ map (h: "acme-${h}.service") acmeHosts;
-      after = [ "network-online.target" ] ++ map (h: "acme-${h}.service") acmeHosts;
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
       # ExecStart reads /etc, so a config change reloads instead of restarting.
       reloadTriggers = [ configFile ];
       serviceConfig = {
@@ -257,7 +210,8 @@ in
         Restart = "on-failure";
         User = "genkan";
         Group = "genkan";
-        SupplementaryGroups = lib.optional (acmeHosts != [ ]) "acme";
+        # hanko writes certificates group-readable; its module declares the group.
+        SupplementaryGroups = [ "hanko" ];
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
         NoNewPrivileges = true;
@@ -265,7 +219,6 @@ in
         ProtectHome = true;
         PrivateTmp = true;
         PrivateDevices = true;
-        StateDirectory = "genkan";
         RestrictAddressFamilies = [
           "AF_INET"
           "AF_INET6"

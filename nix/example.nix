@@ -3,20 +3,19 @@
 {
   system.stateVersion = "26.05";
 
-  security.acme = {
-    acceptTerms = true;
-    defaults.email = "admin@example.org";
-    certs."home.example.org" = {
-      domain = "*.home.example.org";
-      dnsProvider = "porkbun";
-    };
-  };
-
   services.genkan = {
     enable = true;
     listeners.lan.address = "[fd42::10]:443";
-    certificates.home.useACMEHost = "home.example.org";
-    sites."git.home.example.org".backend = "http://127.0.0.1:3000";
+    listeners.edge.address = "[fd42::10]:8443";
+    certificates.home = {
+      hosts = [ "*.home.example.org" ];
+      cert = "/var/lib/hanko/home/fullchain.pem";
+      key = "/var/lib/hanko/home/key.pem";
+    };
+    sites."git.home.example.org" = {
+      backend = "http://127.0.0.1:3000";
+      listeners = [ "lan" ];
+    };
     sites."site.home.example.org".root = "/var/www/site";
   };
 }

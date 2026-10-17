@@ -7,8 +7,7 @@ over an overlay network, and a NixOS module that generates all of its
 configuration.
 
 Status: v0.1 done; v0.2 (SIGHUP reload, sd_notify, NixOS module) implemented,
-awaiting deployment. The v0.2 module still offers `useACMEHost`
-(NixOS `security.acme`); it goes away with hanko (ADR 0004). Decisions live in [`docs/adr/`](docs/adr/),
+awaiting deployment; v0.3 (static routes) implemented. Decisions live in [`docs/adr/`](docs/adr/),
 the plan in [`docs/milestones.md`](docs/milestones.md), the config reference in [`docs/config.md`](docs/config.md).
 
 ## Shape
@@ -37,7 +36,7 @@ Nix files.
 services.genkan = {
   enable = true;
   listeners.lan.address = "[fd42::10]:443";        # default: one listener on ":443"
-  certificates.home = {                                # files from hanko, or sops paths
+  certificates.home = {                                # files written by hanko, or sops paths
     hosts = [ "*.home.example.org" ];
     cert = "/var/lib/hanko/home/fullchain.pem";
     key = "/var/lib/hanko/home/key.pem";
@@ -50,7 +49,12 @@ services.genkan = {
 Each site takes the certificate whose hosts contain its name, exact before
 wildcard, unless it sets `certificate`. `settings` is the raw TOML of
 [`docs/config.md`](docs/config.md); definitions there add to the generated
-ones. A config change reloads `genkan.service` instead of restarting it.
+ones. A config change reloads `genkan.service` instead of restarting it, and so
+does hanko after writing a certificate (genkan re-reads the files on SIGHUP and
+never watches them). The service runs with `SupplementaryGroups = [ "hanko" ]`
+to read hanko's files: the host must declare that group (hanko's module does)
+and hanko must give it to the certificate. No `security.acme`, no state
+directory.
 
 ## License
 
