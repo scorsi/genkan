@@ -16,8 +16,8 @@ one of them is public.
   `CapabilityBoundingSet = CAP_NET_BIND_SERVICE`. Nothing else is privileged.
 - **Secrets:** read in place, as the `genkan` user. sops secrets are declared
   with `owner = "genkan"`, mode `0400`, in the deployment repository. hanko's certificates are
-  read through `SupplementaryGroups = [ "hanko" ]`; hanko writes them readable
-  by its group. No `LoadCredential`.
+  readable by genkan's own group (hanko's per-certificate `group`, set to
+  `genkan`); no supplementary group. No `LoadCredential`.
 - **Filesystem:** `ProtectSystem = "strict"`, `ProtectHome = true`,
   `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`. No writable path: genkan
   has no state. Static roots must be world-readable or group-readable by

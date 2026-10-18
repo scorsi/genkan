@@ -41,7 +41,7 @@ let
     HTTPServer(("127.0.0.1", 8080), Echo).serve_forever()
   '';
 
-  dir = "/var/lib/hanko/test"; # where hanko writes, group per certificate
+  dir = "/var/lib/hanko/test"; # where hanko writes, group genkan per certificate
 in
 pkgs.testers.runNixOSTest {
   name = "genkan";
@@ -55,14 +55,13 @@ pkgs.testers.runNixOSTest {
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${backend}";
     };
 
-    # hanko's module declares this group; here the test stands in for hanko and copies the
+    # The test stands in for hanko (certificate group = genkan's own group) and copies the
     # files out of the store so it can rotate them.
-    users.groups.hanko = { };
     systemd.tmpfiles.rules = [
       "d /var/lib/hanko 0755 root root -"
-      "d ${dir} 2750 root hanko -"
-      "C ${dir}/fullchain.pem 0640 root hanko - ${certs}/first.pem"
-      "C ${dir}/key.pem 0640 root hanko - ${certs}/first.key"
+      "d ${dir} 2750 root genkan -"
+      "C ${dir}/fullchain.pem 0640 root genkan - ${certs}/first.pem"
+      "C ${dir}/key.pem 0640 root genkan - ${certs}/first.key"
     ];
 
     services.genkan = {

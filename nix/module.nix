@@ -210,8 +210,6 @@ in
         Restart = "on-failure";
         User = "genkan";
         Group = "genkan";
-        # hanko writes certificates group-readable; its module declares the group.
-        SupplementaryGroups = [ "hanko" ];
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
         NoNewPrivileges = true;

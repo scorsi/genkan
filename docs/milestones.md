@@ -61,8 +61,7 @@ v0.3 serves it as static files.
   file paths), `sites`, `settings` escape hatch. Generated
   TOML validated in a derivation at build time. Unit: `Type=notify`,
   `ExecReload = genkan validate … && kill -HUP $MAINPID`, static `genkan`
-  user with `CAP_NET_BIND_SERVICE` and the hardening set of ADR 0006,
-  `SupplementaryGroups = [ "hanko" ]`.
+  user with `CAP_NET_BIND_SERVICE` and the hardening set of ADR 0006.
 - Flake exposes `nixosModules.default`.
 
 Acceptance: unit tests for the swap (routes added/removed between two

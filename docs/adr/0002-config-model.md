@@ -236,8 +236,8 @@ Module behaviour: generates the TOML through `pkgs.formats.toml`, runs
 `genkan validate` on it in a derivation, installs it under `/etc/genkan/`,
 and defines `genkan.service` with `Type=notify`, `ExecReload` as in ADR 0003,
 a static `genkan` system user with `AmbientCapabilities = CAP_NET_BIND_SERVICE`
-(ADR 0006), and `SupplementaryGroups = [ "hanko" ]` so that genkan can read
-hanko's files. Reloading genkan after an issuance is wired on hanko's side
+(ADR 0006). hanko's files are read through genkan's own group (hanko's
+per-certificate `group` is `genkan`). Reloading genkan after an issuance is wired on hanko's side
 (its module lists the units to reload); sops `reloadUnits` stays the user's
 responsibility because the module does not know which secrets exist.
 

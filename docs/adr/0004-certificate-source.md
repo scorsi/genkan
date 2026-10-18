@@ -63,7 +63,7 @@ proxies, hanko owns certificates. No product shares code with another.
 
 - genkan has no dependency on any ACME library (ADR 0005) and no writable
   path (ADR 0006).
-- genkan reads hanko's files through the `hanko` group; the paths are a Nix
+- genkan reads hanko's files through its own `genkan` group (hanko's per-certificate `group`); the paths are a Nix
   contract between the two modules, in the deployment repository.
 
 ## Status

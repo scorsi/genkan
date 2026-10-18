@@ -51,9 +51,8 @@ wildcard, unless it sets `certificate`. `settings` is the raw TOML of
 [`docs/config.md`](docs/config.md); definitions there add to the generated
 ones. A config change reloads `genkan.service` instead of restarting it, and so
 does hanko after writing a certificate (genkan re-reads the files on SIGHUP and
-never watches them). The service runs with `SupplementaryGroups = [ "hanko" ]`
-to read hanko's files: the host must declare that group (hanko's module does)
-and hanko must give it to the certificate. No `security.acme`, no state
+never watches them). The service reads hanko's files through its own group: hanko's
+per-certificate `group` must be `genkan`. No `security.acme`, no state
 directory.
 
 ## License
