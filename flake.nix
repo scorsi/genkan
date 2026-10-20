@@ -6,11 +6,11 @@
 
     # Test-only: the VM test runs their validators on genkan's logs and metrics (ADR 0008).
     nisshi = {
-      url = "github:scorsi/nisshi";
+      url = "git+ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/nisshi.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     masu = {
-      url = "github:scorsi/masu";
+      url = "git+ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/masu.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
