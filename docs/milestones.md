@@ -136,8 +136,8 @@ Acceptance: unit tests for precedence rules.
 
 ## Proposals not in scope (need agreement before entering a milestone)
 
-- Admin listener on localhost/overlay with Prometheus `/metrics` and
-  `/healthz` (v1+).
+- Admin listener with `/healthz` (v1+). `/metrics` on loopback is decided by
+  ADR 0008.
 - Connection draining on reload (when a removed listener drops something that
   matters).
 - Response compression, caching, rate limiting, front auth: none requested;

@@ -1,0 +1,69 @@
+package serve
+
+import (
+	"bytes"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/logging"
+	"github.com/scorsi/genkan/internal/metrics"
+)
+
+// A failed handshake becomes a tls-handshake-error schema line and is counted on its listener;
+// the loaded certificate's expiry is exported.
+func TestHandshakeErrorAndExpiry(t *testing.T) {
+	var logs syncBuffer
+	m := metrics.New("test")
+	s := New(logging.New(&logs, slog.LevelInfo), new(slog.LevelVar), m)
+	defer s.Shutdown(0)
+	lan := config.Listener{Name: "lan", Addr: freeAddr(t), Mode: "tls"}
+	if err := s.Apply(&config.Config{
+		Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan},
+		Certificates: map[string]config.Certificate{"a.example": certFiles(t, "a.example")},
+		Routes:       []config.Route{route("a", "lan", "a.example", backend(t, "A"))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(lan.Addr, "unknown.example"); got != "" {
+		t.Fatalf("unknown SNI served %q", got)
+	}
+	var out strings.Builder
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		out.Reset()
+		m.Write(&out)
+		if strings.Contains(out.String(), `genkan_tls_handshake_errors_total{listener="lan"} 1`) {
+			break
+		}
+	}
+	if !strings.Contains(out.String(), `genkan_tls_handshake_errors_total{listener="lan"} 1`+"\n") {
+		t.Errorf("handshake error not counted:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `genkan_certificate_expiry_timestamp_seconds{certificate="a.example"} `) {
+		t.Errorf("no certificate expiry:\n%s", out.String())
+	}
+	if !strings.Contains(logs.String(), `"level":"warn","v":1,"event":"tls-handshake-error","err":"http: TLS handshake error from 127.0.0.1:`) {
+		t.Errorf("handshake error line: %s", logs.String())
+	}
+}
+
+// syncBuffer is written by the server's goroutines while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}

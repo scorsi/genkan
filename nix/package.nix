@@ -3,7 +3,7 @@
   buildGoModule,
   src,
 }:
-buildGoModule {
+buildGoModule (finalAttrs: {
   pname = "genkan";
   version = "0.2.0-dev";
   inherit src;
@@ -14,6 +14,7 @@ buildGoModule {
   ldflags = [
     "-s"
     "-w"
+    "-X main.version=${finalAttrs.version}" # genkan_build_info and the start event
   ];
 
   # `nix flake check` runs this phase: vet first, then the default `go test ./...`.
@@ -27,4 +28,4 @@ buildGoModule {
     license = lib.licenses.asl20;
     mainProgram = "genkan";
   };
-}
+})

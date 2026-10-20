@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/metrics"
 )
 
 // certFiles writes a self-signed pair for host and returns its config entry.
@@ -70,7 +71,7 @@ func route(name, listener, host, backend string) config.Route {
 }
 
 func TestReload(t *testing.T) {
-	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), new(slog.LevelVar))
+	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), new(slog.LevelVar), metrics.New("test"))
 	defer s.Shutdown(0)
 	certs := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certFiles(t, "b.example")}
 	a, b := backend(t, "A"), backend(t, "B")

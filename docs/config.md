@@ -19,10 +19,18 @@ v0 and rejected by `validate` with "not implemented before v1".
 | `level` | string | no | `"info"` | v0.1 | `debug`, `info`, `warn`, `error`. |
 | `access` | bool | no | `true` | v0.1 | One JSON record per HTTP request and per L4 connection. |
 
-Logs go to stderr as JSON (`log/slog`). Access records carry: time, listener,
-route, client address (from the PROXY header on `accept_proxy` listeners,
-otherwise the TCP peer), method, host, path, status, response bytes, duration,
+Logs go to stderr as nisshi log schema v1 lines (ADR 0008), from `run` and
+from `validate` alike. Access records are `"event":"request"` and carry:
+listener, route (`-` when none matched), client address (from the PROXY header
+on `accept_proxy` listeners, otherwise the TCP peer), method, host, path
+(no query string), proto, TLS version, status, response body bytes, `dur_us`,
 user agent. No IP anonymisation.
+
+## `[metrics]`
+
+| Key | Type | Required | Default | Since | Notes |
+|---|---|---|---|---|---|
+| `listen` | string | no | absent | ADR 0008 | `127.0.0.1:<port>` or `[::1]:<port>`, anything else is an error. Serves `GET /metrics` (masu metric convention). Absent: no metrics listener. Bound at start only: a reload does not move it. |
 
 ## `[[listeners]]`
 

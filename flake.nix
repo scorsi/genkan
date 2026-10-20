@@ -1,10 +1,28 @@
 {
   description = "genkan (玄関, the entrance) — reverse proxy for a Nix-managed homelab: package, NixOS module, dev shell";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
+
+    # Test-only: the VM test runs their validators on genkan's logs and metrics (ADR 0008).
+    nisshi = {
+      url = "github:scorsi/nisshi";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    masu = {
+      url = "github:scorsi/masu";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      nisshi,
+      masu,
+      ...
+    }:
     let
       inherit (nixpkgs) lib;
       forAllSystems = lib.genAttrs [
@@ -56,7 +74,10 @@
           module-typo = (pkgsFor system).testers.testBuildFailure (moduleConfig {
             services.genkan.settings.log.levle = "info";
           });
-          vm = import ./nix/vm-test.nix self { pkgs = pkgsFor system; };
+          vm = import ./nix/vm-test.nix self {
+            pkgs = pkgsFor system;
+            inherit nisshi masu;
+          };
         }
       );
 

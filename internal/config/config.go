@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	Log          Log                    `toml:"log"`
+	Metrics      Metrics                `toml:"metrics"`
 	Listeners    []Listener             `toml:"listeners"`
 	Certificates map[string]Certificate `toml:"certificates"`
 	Routes       []Route                `toml:"routes"`
@@ -25,6 +26,11 @@ type Config struct {
 type Log struct {
 	Level  string `toml:"level"`
 	Access bool   `toml:"access"`
+}
+
+// Metrics is the loopback /metrics listener (ADR 0008); an empty Listen disables it.
+type Metrics struct {
+	Listen string `toml:"listen"`
 }
 
 type Listener struct {
@@ -99,6 +105,13 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 	case "debug", "info", "warn", "error":
 	default:
 		bad("log.level: must be debug, info, warn or error, got %q", c.Log.Level)
+	}
+
+	if c.Metrics.Listen != "" {
+		host, port, err := net.SplitHostPort(c.Metrics.Listen)
+		if err != nil || port == "" || (host != "127.0.0.1" && host != "::1") {
+			bad("metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>, got %q", c.Metrics.Listen)
+		}
 	}
 
 	if len(c.Listeners) == 0 {

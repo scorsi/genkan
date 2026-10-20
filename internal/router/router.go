@@ -3,6 +3,8 @@ package router
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +14,9 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/scorsi/genkan/internal/logging"
+	"github.com/scorsi/genkan/internal/metrics"
 )
 
 // Limits of ADR 0007. Variables rather than constants so tests can shrink them.
@@ -31,11 +36,13 @@ var transport = &http.Transport{
 	IdleConnTimeout:     90 * time.Second,
 }
 
-// Router serves one listener: it picks the route by Host and writes one access record per request.
+// Router serves one listener: it picks the route by Host, writes one access record per request and
+// counts it.
 type Router struct {
 	listener string
 	log      *slog.Logger
 	access   bool
+	metrics  *metrics.Registry
 	routes   map[string]entry
 }
 
@@ -44,8 +51,8 @@ type entry struct {
 	h    http.Handler
 }
 
-func New(listener string, log *slog.Logger, access bool) *Router {
-	return &Router{listener: listener, log: log, access: access, routes: map[string]entry{}}
+func New(listener string, log *slog.Logger, access bool, m *metrics.Registry) *Router {
+	return &Router{listener: listener, log: log, access: access, metrics: m, routes: map[string]entry{}}
 }
 
 // Handle serves host (lowercase, no port) with h. route is the name used in logs.
@@ -66,27 +73,42 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if ok {
 		e.h.ServeHTTP(rec, req)
 	} else {
+		e.name = "-" // the log schema's "no route"
 		http.NotFound(rec, req)
 	}
+	d := time.Since(start)
+	r.metrics.Request(r.listener, e.name, req.Method, rec.status, rec.bytes, d)
 	if r.access {
-		r.log.Info("request",
+		r.log.Info("",
+			"event", "request",
 			"listener", r.listener,
 			"route", e.name,
 			"client", hostOnly(req.RemoteAddr),
 			"method", req.Method,
-			"host", req.Host,
+			"host", hostOnly(req.Host),
 			"path", req.URL.Path,
+			"proto", req.Proto,
+			"tls", tlsVersion(req.TLS),
 			"status", rec.status,
 			"bytes", rec.bytes,
-			"duration", time.Since(start),
+			"dur_us", d.Microseconds(),
 			"user_agent", req.UserAgent(),
 		)
 	}
 }
 
+// tlsVersion is "1.3" for TLS 1.3, "-" without TLS.
+func tlsVersion(cs *tls.ConnectionState) string {
+	if cs == nil {
+		return "-"
+	}
+	return strings.TrimPrefix(tls.VersionName(cs.Version), "TLS ")
+}
+
 // Proxy forwards to backend, keeping the client's Host and overwriting X-Forwarded-For, -Host and
 // -Proto with values genkan trusts (ReverseProxy strips the client's copies before Rewrite runs).
-func Proxy(backend *url.URL, log *slog.Logger) http.Handler {
+// A backend that fails answers 502, logged as upstream-error and counted on route.
+func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metrics.Registry) http.Handler {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(backend)
@@ -94,7 +116,16 @@ func Proxy(backend *url.URL, log *slog.Logger) http.Handler {
 			pr.SetXForwarded()
 		},
 		Transport: transport,
-		ErrorLog:  slog.NewLogLogger(log.Handler(), slog.LevelError),
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			// A client that went away is not the backend's fault (httputil's default handler agrees).
+			if !errors.Is(err, context.Canceled) {
+				m.UpstreamError(route)
+				log.Warn("", "event", "upstream-error", "listener", listener, "route", route, "err", err.Error())
+			}
+			w.WriteHeader(http.StatusBadGateway)
+		},
+		// What ReverseProxy still logs itself: a copy error once the response has started.
+		ErrorLog: logging.Std(log, func(string) string { return "proxy-error" }),
 	}
 }
 

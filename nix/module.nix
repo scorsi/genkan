@@ -161,6 +161,16 @@ in
       description = "Sites, by hostname: an HTTP backend or a static root.";
     };
 
+    metrics.listen = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "127.0.0.1:9101";
+      description = ''
+        Loopback `127.0.0.1:<port>` or `[::1]:<port>` serving `GET /metrics` for the local agent
+        (ADR 0008); null serves no metrics. Bound at start only: a change restarts genkan.
+      '';
+    };
+
     settings = mkOption {
       inherit (toml) type;
       default = { };
@@ -172,10 +182,19 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = lib.mapAttrsToList (host: site: {
-      assertion = (site.backend != null) != (site.root != null);
-      message = "services.genkan.sites.\"${host}\": set exactly one of backend and root.";
-    }) cfg.sites;
+    assertions =
+      lib.mapAttrsToList (host: site: {
+        assertion = (site.backend != null) != (site.root != null);
+        message = "services.genkan.sites.\"${host}\": set exactly one of backend and root.";
+      }) cfg.sites
+      ++ [
+        {
+          assertion =
+            cfg.metrics.listen == null
+            || builtins.match "(127\\.0\\.0\\.1|\\[::1]):[0-9]+" cfg.metrics.listen != null;
+          message = "services.genkan.metrics.listen: must be 127.0.0.1:<port> or [::1]:<port> (loopback only, ADR 0008).";
+        }
+      ];
 
     services.genkan.settings = {
       log = lib.mapAttrs (_: lib.mkDefault) {
@@ -183,7 +202,8 @@ in
         access = true;
       };
       inherit (generated) listeners certificates routes;
-    };
+    }
+    // lib.optionalAttrs (cfg.metrics.listen != null) { metrics.listen = cfg.metrics.listen; };
 
     environment.etc."genkan/genkan.toml".source = configFile;
 
@@ -200,6 +220,8 @@ in
       after = [ "network-online.target" ];
       # ExecStart reads /etc, so a config change reloads instead of restarting.
       reloadTriggers = [ configFile ];
+      # Except the metrics listener, which a reload does not move (ADR 0008).
+      restartTriggers = [ (toString cfg.metrics.listen) ];
       serviceConfig = {
         Type = "notify";
         ExecStart = "${exe} run ${path}";
@@ -223,6 +245,9 @@ in
           "AF_UNIX"
         ];
         LimitNOFILE = 65536;
+        # One line per request: 1000 lines/s sustained before journald drops (nisshi ADR 0009).
+        LogRateLimitIntervalSec = lib.mkDefault "30s";
+        LogRateLimitBurst = lib.mkDefault 30000;
       };
     };
   };

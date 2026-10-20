@@ -1,9 +1,21 @@
 # NixOS VM test (milestone v0.3): genkan in front of one HTTP backend and one static root, two
 # hostnames, self-signed certificates. curl asserts routing, forwarding headers, unknown SNI, a
 # certificate rotation picked up by `systemctl reload`, and a failed reload that keeps serving.
+# Then (ADR 0008) every line genkan wrote passes `nisshi validate --logs`, and /metrics passes
+# `masu validate --metrics` and counts the requests.
 self:
-{ pkgs, ... }:
+{
+  pkgs,
+  nisshi,
+  masu,
+  ...
+}:
 let
+  system = pkgs.stdenv.hostPlatform.system;
+  validateLogs = nisshi.lib.validateLogs.${system};
+  validateMetrics = masu.lib.validateMetrics.${system};
+  metrics = "127.0.0.1:9101";
+
   # A CA, a leaf for both hosts, and a second leaf with another subject for the rotation.
   certs = pkgs.runCommand "genkan-test-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir $out && cd $out
@@ -76,6 +88,7 @@ pkgs.testers.runNixOSTest {
       };
       sites."app.test".backend = "http://127.0.0.1:8080";
       sites."site.test".root = site;
+      metrics.listen = metrics;
     };
 
     environment.systemPackages = [
@@ -129,10 +142,41 @@ pkgs.testers.runNixOSTest {
     with subtest("failed reload keeps the running config"):
         machine.succeed("echo garbage > ${dir}/fullchain.pem")
         machine.succeed("systemctl reload genkan")
-        machine.wait_until_succeeds("journalctl -u genkan | grep 'reload failed'")
+        machine.wait_until_succeeds("journalctl -u genkan -o cat | grep -F '\"event\":\"reload-failed\"'")
         assert "rotated" in subject()
         assert curl("app.test").endswith(" 200")
 
     assert machine.succeed("systemctl show -P MainPID genkan").strip() == pid, "genkan restarted"
+
+    # Only genkan's own lines: `-u` would add PID 1's "Started …", which is not JSON.
+    journal = "journalctl _SYSTEMD_UNIT=genkan.service -o cat"
+
+    with subtest("every log line passes the log schema"):
+        for fields in [
+            ['"event":"request"', '"route":"app.test"', '"path":"/"', '"tls":"1.3"', '"status":200'],
+            ['"event":"request"', '"route":"site.test"', '"path":"/missing"', '"status":404'],
+            ['"event":"tls-handshake-error"'],
+            ['"event":"listening"', '"listener":"default"'],
+        ]:
+            machine.wait_until_succeeds(journal + "".join(f" | grep -F '{x}'" for x in fields))
+        machine.succeed(f"{journal} | ${validateLogs} validate --logs")
+
+    def scrape():
+        return machine.succeed("curl -sS http://${metrics}/metrics")
+
+    def requests_total(route):
+        prefix = f'genkan_requests_total{{listener="default",route="{route}",method="GET",code="2xx"}} '
+        return sum(int(l[len(prefix):]) for l in scrape().splitlines() if l.startswith(prefix))
+
+    with subtest("metrics pass the metric convention and count requests"):
+        machine.succeed("${validateMetrics} validate --metrics http://${metrics}/metrics")
+        out = scrape()
+        assert 'genkan_build_info{version="${self.packages.${system}.default.version}"} 1' in out, out
+        assert 'genkan_tls_handshake_errors_total{listener="default"} ' in out, out
+        assert 'genkan_certificate_expiry_timestamp_seconds{certificate="test"} ' in out, out
+        before = requests_total("app.test")
+        assert before > 0, out
+        curl("app.test")
+        assert requests_total("app.test") == before + 1
   '';
 }

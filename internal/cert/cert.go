@@ -34,6 +34,17 @@ func (f Files) Covers(name, host string) bool {
 	return c != nil && c.Leaf != nil && c.Leaf.VerifyHostname(host) == nil
 }
 
+// Expiry is each certificate's leaf NotAfter in Unix seconds.
+func (f Files) Expiry() map[string]int64 {
+	m := map[string]int64{}
+	for name, c := range f {
+		if c.Leaf != nil {
+			m[name] = c.Leaf.NotAfter.Unix()
+		}
+	}
+	return m
+}
+
 func keys[V any](m map[string]V) func(func(string) bool) {
 	return func(yield func(string) bool) {
 		for k := range m {

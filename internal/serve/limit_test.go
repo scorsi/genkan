@@ -2,7 +2,7 @@ package serve
 
 import (
 	"io"
-	"log/slog"
+	"log"
 	"net"
 	"net/http"
 	"testing"
@@ -59,7 +59,7 @@ func TestHeaderDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := newServer(http.NotFoundHandler(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := newServer(http.NotFoundHandler(), nil, log.New(io.Discard, "", 0))
 	go srv.Serve(ln)
 	defer srv.Close()
 

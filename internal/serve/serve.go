@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/scorsi/genkan/internal/cert"
 	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/logging"
+	"github.com/scorsi/genkan/internal/metrics"
 	"github.com/scorsi/genkan/internal/router"
 )
 
@@ -43,20 +46,25 @@ func TLSConfig(hosts func() map[string]*tls.Certificate) *tls.Config {
 	}
 }
 
-func newServer(h http.Handler, tlsConfig *tls.Config, log *slog.Logger) *http.Server {
+// newServer sends net/http's own error lines to errorLog: they must be schema lines too.
+func newServer(h http.Handler, tlsConfig *tls.Config, errorLog *log.Logger) *http.Server {
 	return &http.Server{
 		Handler:           h,
 		TLSConfig:         tlsConfig,
 		ReadHeaderTimeout: ReadHeaderTimeout,
 		IdleTimeout:       IdleTimeout,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
+		ErrorLog:          errorLog,
 	}
 }
 
+// handshakeError is how net/http reports a failed TLS handshake; it offers no other hook.
+const handshakeError = "http: TLS handshake error"
+
 // state is what one listener serves; a reload replaces it whole.
 type state struct {
-	rt    *router.Router
-	hosts map[string]*tls.Certificate
+	listener string
+	rt       *router.Router
+	hosts    map[string]*tls.Certificate
 }
 
 // slot is one bound address. It survives reloads as long as some listener keeps its addr.
@@ -68,14 +76,15 @@ type slot struct {
 
 // Server holds the bound addresses and the routing state served on each.
 type Server struct {
-	log   *slog.Logger
-	level *slog.LevelVar
-	slots map[string]*slot // by listener addr
+	log     *slog.Logger
+	level   *slog.LevelVar
+	metrics *metrics.Registry
+	slots   map[string]*slot // by listener addr
 }
 
 // New returns a Server with nothing bound. Apply sets level from each config's log.level.
-func New(log *slog.Logger, level *slog.LevelVar) *Server {
-	return &Server{log: log, level: level, slots: map[string]*slot{}}
+func New(log *slog.Logger, level *slog.LevelVar, m *metrics.Registry) *Server {
+	return &Server{log: log, level: level, metrics: m, slots: map[string]*slot{}}
 }
 
 // Apply loads cfg's certificates, builds every listener's routes and binds the addresses not yet
@@ -86,6 +95,7 @@ func (s *Server) Apply(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+
 	states := map[string]*state{}
 	for _, l := range cfg.Listeners {
 		st, err := s.build(l.Name, cfg, certs)
@@ -117,7 +127,7 @@ func (s *Server) Apply(cfg *config.Config) error {
 		}
 		sl.state.Store(states[l.Addr])
 		slots[l.Addr] = sl
-		s.log.Info("listening", "listener", l.Name, "addr", sl.ln.Addr().String(), "hosts", len(states[l.Addr].hosts))
+		s.log.Info("", "event", "listening", "listener", l.Name, "addr", sl.ln.Addr().String(), "hosts", len(states[l.Addr].hosts))
 	}
 	for _, sl := range fresh {
 		s.start(sl)
@@ -125,16 +135,17 @@ func (s *Server) Apply(cfg *config.Config) error {
 	for addr, sl := range s.slots {
 		if slots[addr] == nil {
 			sl.srv.Close() // no draining in v0 (ADR 0003): in-flight connections are dropped
-			s.log.Info("closed", "addr", addr)
+			s.log.Info("", "event", "listener-closed", "addr", addr)
 		}
 	}
 	s.slots = slots
 	s.level.UnmarshalText([]byte(cfg.Log.Level))
+	s.metrics.SetCertificates(certs.Expiry())
 	return nil
 }
 
 func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*state, error) {
-	st := &state{rt: router.New(listener, s.log, cfg.Log.Access), hosts: map[string]*tls.Certificate{}}
+	st := &state{listener: listener, rt: router.New(listener, s.log, cfg.Log.Access, s.metrics), hosts: map[string]*tls.Certificate{}}
 	for _, r := range cfg.Routes {
 		if !slices.Contains(r.Listeners, listener) {
 			continue
@@ -146,7 +157,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 			if err != nil {
 				return nil, fmt.Errorf("route %q: %w", r.Name, err)
 			}
-			h = router.Proxy(backend, s.log)
+			h = router.Proxy(backend, listener, r.Name, s.log, s.metrics)
 		case "static":
 			h = router.Static(r.Root)
 		}
@@ -154,7 +165,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 			st.rt.Handle(host, r.Name, h)
 			st.hosts[host] = certs[r.Certificate]
 			if !certs.Covers(r.Certificate, host) {
-				s.log.Warn("certificate does not cover host", "certificate", r.Certificate, "host", host, "route", r.Name)
+				s.log.Warn("certificate does not cover host", "event", "certificate-mismatch", "certificate", r.Certificate, "host", host, "route", r.Name)
 			}
 		}
 	}
@@ -164,10 +175,17 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 // start serves sl with whatever state it holds at each request and each handshake.
 func (s *Server) start(sl *slot) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { sl.state.Load().rt.ServeHTTP(w, r) })
-	sl.srv = newServer(h, TLSConfig(func() map[string]*tls.Certificate { return sl.state.Load().hosts }), s.log)
+	errorLog := logging.Std(s.log, func(line string) string {
+		if strings.HasPrefix(line, handshakeError) {
+			s.metrics.HandshakeError(sl.state.Load().listener)
+			return "tls-handshake-error"
+		}
+		return "http-error"
+	})
+	sl.srv = newServer(h, TLSConfig(func() map[string]*tls.Certificate { return sl.state.Load().hosts }), errorLog)
 	go func() {
 		if err := sl.srv.ServeTLS(limit(sl.ln, MaxConns), "", ""); !errors.Is(err, http.ErrServerClosed) {
-			s.log.Error("listener stopped", "addr", sl.ln.Addr().String(), "err", err)
+			s.log.Error("", "event", "listener-stopped", "addr", sl.ln.Addr().String(), "err", err.Error())
 		}
 	}()
 }
@@ -182,20 +200,28 @@ func (s *Server) Shutdown(timeout time.Duration) {
 }
 
 // Run serves cfg until ctx is done. SIGHUP re-reads path and applies it; a config that fails to
-// load or apply is logged and the running one stays (ADR 0003). READY=1 is sent to systemd once
-// every listener is bound.
-func Run(ctx context.Context, path string, cfg *config.Config, log *slog.Logger, level *slog.LevelVar) error {
+// load or apply is logged and the running one stays (ADR 0003). The metrics listener is bound once,
+// at start: a reload does not move it (ADR 0008). READY=1 is sent to systemd once every listener
+// is bound.
+func Run(ctx context.Context, path string, cfg *config.Config, log *slog.Logger, level *slog.LevelVar, m *metrics.Registry) error {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
 
-	s := New(log, level)
+	s := New(log, level, m)
 	if err := s.Apply(cfg); err != nil {
 		return err
 	}
 	defer s.Shutdown(5 * time.Second)
+	if cfg.Metrics.Listen != "" {
+		stop, err := serveMetrics(cfg.Metrics.Listen, log, m)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
 	if err := notify("READY=1"); err != nil {
-		log.Warn("sd_notify failed", "err", err)
+		log.Warn("", "event", "sd-notify-failed", "err", err.Error())
 	}
 	for {
 		select {
@@ -204,18 +230,36 @@ func Run(ctx context.Context, path string, cfg *config.Config, log *slog.Logger,
 		case <-hup:
 			cfg, warnings, err := config.Load(path)
 			for _, w := range warnings {
-				log.Warn(w)
+				log.Warn("", "event", "config-warning", "err", w)
 			}
 			if err == nil {
 				err = s.Apply(cfg)
 			}
 			if err != nil {
-				log.Error("reload failed, keeping the running config", "err", err)
+				log.Error("keeping the running config", "event", "reload-failed", "err", err.Error())
 				continue
 			}
-			log.Info("reloaded", "path", path)
+			log.Info("", "event", "reloaded", "path", path)
 		}
 	}
+}
+
+// serveMetrics answers GET /metrics on addr (loopback, checked by config) until stop is called.
+func serveMetrics(addr string, log *slog.Logger, m *metrics.Registry) (stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("metrics.listen: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m)
+	srv := newServer(mux, nil, logging.Std(log, func(string) string { return "http-error" }))
+	go func() {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			log.Error("", "event", "listener-stopped", "addr", addr, "err", err.Error())
+		}
+	}()
+	log.Info("", "event", "metrics-listening", "addr", ln.Addr().String())
+	return func() { srv.Close() }, nil
 }
 
 // notify writes state to systemd's NOTIFY_SOCKET; a no-op outside a Type=notify unit. Go maps a

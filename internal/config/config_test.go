@@ -70,6 +70,8 @@ func TestInvalid(t *testing.T) {
 		{"tcp listener with http route", strings.Replace(valid, `mode = "tls"`, `mode = "tcp"`, 1), `listener "lan" is tcp, only tcp routes may use it`},
 		{"tcp listener without route", valid + "\n[[listeners]]\nname = \"ssh\"\naddr = \":22\"\nmode = \"tcp\"\n", `listener "ssh": tcp mode needs exactly one route, has 0`},
 		{"bad type", strings.Replace(valid, `type = "http"`, `type = "grpc"`, 1), "type must be"},
+		{"public metrics", valid + "\n[metrics]\nlisten = \"0.0.0.0:9100\"\n", "metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>"},
+		{"metrics without port", valid + "\n[metrics]\nlisten = \"127.0.0.1\"\n", "metrics.listen"},
 		{"missing cert key", strings.Replace(valid, "key = \"/tmp/git.key\"\n", "", 1), "certificates.git: key is required"},
 	}
 	for _, tt := range tests {
@@ -93,6 +95,18 @@ func TestInvalid(t *testing.T) {
 				t.Fatalf("got %q, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidMetrics(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:9100", "[::1]:9100"} {
+		c, err := Parse(strings.NewReader(valid + "\n[metrics]\nlisten = \"" + addr + "\"\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if errs, _ := c.Validate(); len(errs) > 0 || c.Metrics.Listen != addr {
+			t.Errorf("%s: errs=%v listen=%q", addr, errs, c.Metrics.Listen)
+		}
 	}
 }
 

@@ -10,8 +10,13 @@ import (
 	"syscall"
 
 	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/logging"
+	"github.com/scorsi/genkan/internal/metrics"
 	"github.com/scorsi/genkan/internal/serve"
 )
+
+// version is set by the Nix build (-X main.version=…).
+var version = "dev"
 
 const usage = `usage: genkan <command> <config.toml>
 
@@ -25,25 +30,28 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+	// Both commands log schema lines: `validate` also runs as the unit's ExecReload, so its output
+	// lands in the unit's journal next to `run`'s (ADR 0008).
+	level := new(slog.LevelVar) // a reload may change it
+	log := logging.New(os.Stderr, level)
 	cfg, warnings, err := config.Load(os.Args[2])
 	for _, w := range warnings {
-		fmt.Fprintln(os.Stderr, "warning:", w)
+		log.Warn("", "event", "config-warning", "err", w)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error("", "event", "config-invalid", "err", err.Error())
 		os.Exit(1)
 	}
 	if os.Args[1] == "validate" {
 		return
 	}
 
-	level := new(slog.LevelVar) // a reload may change it
 	level.UnmarshalText([]byte(cfg.Log.Level))
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	log.Info("", "event", "start", "version", version)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := serve.Run(ctx, os.Args[2], cfg, log, level); err != nil {
-		log.Error("fatal", "err", err)
+	if err := serve.Run(ctx, os.Args[2], cfg, log, level, metrics.New(version)); err != nil {
+		log.Error("", "event", "fatal", "err", err.Error())
 		os.Exit(1)
 	}
 }

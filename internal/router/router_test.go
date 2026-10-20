@@ -15,6 +15,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scorsi/genkan/internal/logging"
+	"github.com/scorsi/genkan/internal/metrics"
 )
 
 // echo answers with its name and the forwarding headers it received.
@@ -31,10 +34,11 @@ func TestRouting(t *testing.T) {
 	b := httptest.NewServer(echo("B"))
 	defer b.Close()
 	var logs bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	r := New("lan", log, true)
-	r.Handle("a.example", "route-a", Proxy(mustURL(a.URL), log))
-	r.Handle("b.example", "route-b", Proxy(mustURL(b.URL), log))
+	log := logging.New(&logs, slog.LevelInfo)
+	m := metrics.New("test")
+	r := New("lan", log, true, m)
+	r.Handle("a.example", "route-a", Proxy(mustURL(a.URL), "lan", "route-a", log, m))
+	r.Handle("b.example", "route-b", Proxy(mustURL(b.URL), "lan", "route-b", log, m))
 	front := httptest.NewServer(r)
 	defer front.Close()
 
@@ -66,20 +70,51 @@ func TestRouting(t *testing.T) {
 			t.Errorf("%s: forwarding headers not overwritten: %q", tt.host, body)
 		}
 	}
-	if !strings.Contains(logs.String(), `"route":"route-a"`) || !strings.Contains(logs.String(), `"status":404`) {
-		t.Errorf("access log: %s", logs.String())
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != len(tests) {
+		t.Fatalf("want one request line per request, got %q", lines)
+	}
+	for _, field := range []string{`"event":"request"`, `"listener":"lan"`, `"route":"route-a"`, `"method":"GET"`,
+		`"host":"a.example"`, `"path":"/p"`, `"proto":"HTTP/1.1"`, `"tls":"-"`, `"status":200`, `"dur_us":`} {
+		if !strings.Contains(lines[0], field) {
+			t.Errorf("request line lacks %s: %s", field, lines[0])
+		}
+	}
+	if !strings.Contains(lines[3], `"route":"-"`) || !strings.Contains(lines[3], `"status":404`) {
+		t.Errorf("unrouted request line: %s", lines[3])
+	}
+	var out strings.Builder
+	m.Write(&out)
+	for _, want := range []string{
+		`genkan_requests_total{listener="lan",route="route-a",method="GET",code="2xx"} 2`,
+		`genkan_requests_total{listener="lan",route="-",method="GET",code="4xx"} 1`,
+		`genkan_request_duration_seconds_count{listener="lan",route="route-b"} 1`,
+	} {
+		if !strings.Contains(out.String(), want+"\n") {
+			t.Errorf("metrics lack %s:\n%s", want, out.String())
+		}
 	}
 }
 
 func TestBadBackend(t *testing.T) {
-	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	r := New("lan", log, false)
-	r.Handle("a.example", "a", Proxy(mustURL("http://127.0.0.1:1"), log))
+	var logs bytes.Buffer
+	log := logging.New(&logs, slog.LevelInfo)
+	m := metrics.New("test")
+	r := New("lan", log, false, m)
+	r.Handle("a.example", "a", Proxy(mustURL("http://127.0.0.1:1"), "lan", "a", log, m))
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://a.example/", nil)
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("got %d, want 502", rec.Code)
+	}
+	if l := logs.String(); !strings.Contains(l, `"level":"warn","v":1,"event":"upstream-error","listener":"lan","route":"a","err":"dial tcp 127.0.0.1:1:`) {
+		t.Errorf("upstream-error line: %s", l)
+	}
+	var out strings.Builder
+	m.Write(&out)
+	if !strings.Contains(out.String(), "genkan_upstream_errors_total{route=\"a\"} 1\n") {
+		t.Errorf("upstream error not counted:\n%s", out.String())
 	}
 }
 
@@ -93,8 +128,9 @@ func TestProgressDeadline(t *testing.T) {
 	}))
 	defer backend.Close()
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	r := New("lan", log, false)
-	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), log))
+	m := metrics.New("test")
+	r := New("lan", log, false, m)
+	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m))
 	front := httptest.NewServer(r)
 	defer front.Close()
 
