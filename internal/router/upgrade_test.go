@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,7 +16,7 @@ import (
 func TestWebSocketRoundTrip(t *testing.T) {
 	shortTimeout(t)
 	finished := make(chan struct{})
-	front, _, _ := proxied(t, func(w http.ResponseWriter, r *http.Request) {
+	front, logs, m := proxied(t, func(w http.ResponseWriter, r *http.Request) {
 		defer close(finished)
 		c, buf, err := http.NewResponseController(w).Hijack()
 		if err != nil {
@@ -59,6 +60,15 @@ func TestWebSocketRoundTrip(t *testing.T) {
 		case <-finished:
 		case <-time.After(3 * time.Second):
 			t.Error("WebSocket backend did not exit")
+		}
+		// Re-check R1: the upgrade is logged and counted as the 101 the client received.
+		if !waitFor(logs, `"status":101`) {
+			t.Errorf("upgrade not logged as 101: %s", logs.String())
+		}
+		var out strings.Builder
+		m.Write(&out)
+		if !strings.Contains(out.String(), `genkan_requests_total{listener="lan",route="a",method="GET",code="1xx"} 1`+"\n") {
+			t.Errorf("upgrade not counted as 1xx:\n%s", out.String())
 		}
 	}()
 	c.SetDeadline(time.Now().Add(3 * time.Second))

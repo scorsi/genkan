@@ -76,8 +76,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rec := &recorder{ResponseWriter: w, rc: rc, status: http.StatusOK}
 	// net/http must retain its original body to detect early Close and disable keep-alive.
 	req = req.WithContext(req.Context())
+	var body *progressReader
 	if req.Body != nil && req.Body != http.NoBody {
-		body := &progressReader{ReadCloser: req.Body, rc: rc}
+		body = &progressReader{ReadCloser: req.Body, rc: rc}
 		req.Body = body
 		if req.ProtoMajor == 1 {
 			rec.input = body
@@ -93,6 +94,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if !rec.hijacked {
 			rec.closeInput()
 			rec.push() // net/http flushes its final buffered output after ServeHTTP returns
+		}
+		if body != nil {
+			body.finish()
 		}
 		r.done(req, e.name, rec, start)
 	}()
@@ -189,32 +193,50 @@ func hostOnly(hostport string) string {
 	return strings.ToLower(hostport)
 }
 
-// progressReader bounds explicit reads and net/http's bounded discard inside Close.
+// progressReader bounds explicit reads and net/http's bounded discard inside Close. The transport
+// may still read or close the body after the handler returned (backend answered early): rc belongs
+// to the finished request then (HTTP/2 frees it), so mu serialises rc calls with finish.
 type progressReader struct {
 	io.ReadCloser
 	rc     *http.ResponseController
 	mu     sync.Mutex
 	closed bool
+	done   bool
+}
+
+// deadline sets the read deadline unless the handler returned or, for a reset, Close took over.
+func (p *progressReader) deadline(d time.Time, reset bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.done && !(reset && p.closed) {
+		p.rc.SetReadDeadline(d)
+	}
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.rc.SetReadDeadline(time.Now().Add(ProgressTimeout))
-	defer p.rc.SetReadDeadline(time.Time{})
+	p.deadline(time.Now().Add(ProgressTimeout), false)
+	defer p.deadline(time.Time{}, true)
 	return p.ReadCloser.Read(b)
 }
 
 func (p *progressReader) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
-	p.rc.SetReadDeadline(time.Now().Add(ProgressTimeout))
-	defer p.rc.SetReadDeadline(time.Time{})
+	p.mu.Unlock()
+	p.deadline(time.Now().Add(ProgressTimeout), false)
+	defer p.deadline(time.Time{}, false)
 	return p.ReadCloser.Close()
+}
+
+// finish runs before the handler returns; later reads and closes leave rc alone.
+func (p *progressReader) finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.done = true
 }
 
 type recorder struct {
@@ -269,7 +291,9 @@ func (r *recorder) FlushError() error {
 func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	c, buf, err := r.rc.Hijack()
 	if err == nil {
+		// Only ReverseProxy hijacks, to write a backend's 101 itself on the raw connection.
 		r.hijacked = true
+		r.status = http.StatusSwitchingProtocols
 	}
 	return c, buf, err
 }

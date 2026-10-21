@@ -420,3 +420,23 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+// Re-check R2: a backend answering an HTTP/2 upload early leaves the transport reading the request
+// body after the handler returned; that read must not touch the finished stream's writer.
+func TestH2EarlyResponseDuringUpload(t *testing.T) {
+	front, logs, _ := proxied(t, func(w http.ResponseWriter, r *http.Request) {
+		r.Body.Read(make([]byte, 1))
+		w.Header().Set("Connection", "close") // net/http would otherwise drain the rest of the body first
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	}, true)
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go pw.Write([]byte("x")) // then the upload stays pending
+	if _, err := do(t, front, "POST", pr); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(logs, `"status":413`) {
+		t.Fatalf("no 413 request line: %s", logs.String())
+	}
+	time.Sleep(100 * time.Millisecond) // lets the transport's pending body read unwind
+}
