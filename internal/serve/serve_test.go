@@ -35,7 +35,7 @@ func TestSNISelection(t *testing.T) {
 		"a.example": selfSigned(t, "a.example"),
 		"b.example": selfSigned(t, "b.example"),
 	}
-	cfg := TLSConfig(hosts)
+	cfg := TLSConfig(hosts, new(tls.Config))
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
 	if err != nil {
 		t.Fatal(err)

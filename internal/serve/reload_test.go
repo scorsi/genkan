@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -184,59 +185,83 @@ func TestNotify(t *testing.T) {
 // G4: a TLS session resumed after a reload is checked against the current state: a removed name
 // does not resume, and a rotated certificate is the one served.
 func TestResumptionAfterReload(t *testing.T) {
-	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), new(slog.LevelVar), metrics.New("test"))
-	defer s.Shutdown(0)
-	lan := config.Listener{Name: "lan", Addr: freeAddr(t), Mode: "tls"}
-	a, b := backend(t, "A"), backend(t, "B")
-	apply := func(certs map[string]config.Certificate, routes ...config.Route) {
-		t.Helper()
-		if err := s.Apply(&config.Config{Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan}, Certificates: certs, Routes: routes}); err != nil {
-			t.Fatal(err)
+	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
+		for _, h2 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("TLS%x/h2=%t", version, h2), func(t *testing.T) {
+				s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), new(slog.LevelVar), metrics.New("test"))
+				defer s.Shutdown(0)
+				lan := config.Listener{Name: "lan", Addr: freeAddr(t), Mode: "tls"}
+				a, b := backend(t, "A"), backend(t, "B")
+				apply := func(certs map[string]config.Certificate, routes ...config.Route) {
+					t.Helper()
+					if err := s.Apply(&config.Config{Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan}, Certificates: certs, Routes: routes}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cache := tls.NewLRUClientSessionCache(8)
+				// dial reads the response and session ticket on a fresh connection; nil if TLS fails.
+				dial := func(sni string) *tls.ConnectionState {
+					tr := &http.Transport{
+						TLSClientConfig:   &tls.Config{ServerName: sni, InsecureSkipVerify: true, ClientSessionCache: cache, MinVersion: version, MaxVersion: version},
+						ForceAttemptHTTP2: h2,
+						DisableKeepAlives: true,
+					}
+					defer tr.CloseIdleConnections()
+					req, _ := http.NewRequest("GET", "https://"+lan.Addr+"/", nil)
+					req.Host = sni
+					resp, err := (&http.Client{Transport: tr}).Do(req)
+					if err != nil {
+						return nil
+					}
+					defer resp.Body.Close()
+					if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+						t.Fatal(err)
+					}
+					if h2 && (resp.ProtoMajor != 2 || resp.TLS.NegotiatedProtocol != "h2") {
+						t.Fatalf("HTTP/2 not negotiated: %s, %s", resp.Proto, resp.TLS.NegotiatedProtocol)
+					}
+					return resp.TLS
+				}
+
+				certA := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certFiles(t, "b.example")}
+				apply(certA, route("a", "lan", "a.example", a), route("b", "lan", "b.example", b))
+				if dial("a.example") == nil {
+					t.Fatal("first handshake failed")
+				}
+
+				if cs := dial("a.example"); cs == nil || !cs.DidResume {
+					t.Fatal("session not resumed without a reload: the test proves nothing")
+				}
+
+				// Re-reading the same files must preserve resumption, even if another name changes.
+				apply(certA, route("a", "lan", "a.example", a), route("b", "lan", "b.example", b))
+				if cs := dial("a.example"); cs == nil || !cs.DidResume {
+					t.Fatal("unchanged certificate did not resume after reload")
+				}
+				other := map[string]config.Certificate{"a.example": certA["a.example"], "b.example": certFiles(t, "b.example")}
+				apply(other, route("a", "lan", "a.example", a), route("b", "lan", "b.example", b))
+				if cs := dial("a.example"); cs == nil || !cs.DidResume {
+					t.Fatal("another name's certificate rotation invalidated this session")
+				}
+
+				// a.example removed: its cached session must not reach the listener.
+				apply(certA, route("b", "lan", "b.example", b))
+				if cs := dial("a.example"); cs != nil {
+					t.Errorf("removed name resumed=%v", cs.DidResume)
+				}
+
+				// a.example back with a rotated certificate: the resumed session must not keep the old one.
+				apply(certA, route("a", "lan", "a.example", a))
+				dial("a.example")
+				rotated := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certA["b.example"]}
+				want, _ := os.ReadFile(rotated["a.example"].Cert)
+				apply(rotated, route("a", "lan", "a.example", a))
+				cs := dial("a.example")
+				if cs == nil || cs.DidResume || !strings.Contains(string(want), pemBody(cs.PeerCertificates[0].Raw)) {
+					t.Errorf("after rotation: %v, want a full handshake with the new certificate", cs)
+				}
+			})
 		}
-	}
-	cache := tls.NewLRUClientSessionCache(8)
-	// dial does one request over a TLS 1.3 connection sharing cache; nil if the handshake fails.
-	dial := func(sni string) *tls.ConnectionState {
-		c, err := tls.Dial("tcp", lan.Addr, &tls.Config{ServerName: sni, InsecureSkipVerify: true, ClientSessionCache: cache, MinVersion: tls.VersionTLS13})
-		if err != nil {
-			return nil
-		}
-		defer c.Close()
-		io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+sni+"\r\nConnection: close\r\n\r\n")
-		io.ReadAll(c) // reads the session ticket too
-		cs := c.ConnectionState()
-		return &cs
-	}
-
-	certA := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certFiles(t, "b.example")}
-	apply(certA, route("a", "lan", "a.example", a), route("b", "lan", "b.example", b))
-	if dial("a.example") == nil {
-		t.Fatal("first handshake failed")
-	}
-	if c, err := tls.Dial("tcp", lan.Addr, &tls.Config{ServerName: "a.example", InsecureSkipVerify: true, NextProtos: []string{"h2"}}); err != nil || c.ConnectionState().NegotiatedProtocol != "h2" {
-		t.Errorf("HTTP/2 not offered: %v", err)
-	} else {
-		c.Close()
-	}
-	if cs := dial("a.example"); cs == nil || !cs.DidResume {
-		t.Fatal("session not resumed without a reload: the test proves nothing")
-	}
-
-	// a.example removed: its cached session must not reach the listener.
-	apply(certA, route("b", "lan", "b.example", b))
-	if cs := dial("a.example"); cs != nil {
-		t.Errorf("removed name resumed=%v", cs.DidResume)
-	}
-
-	// a.example back with a rotated certificate: the resumed session must not keep the old one.
-	apply(certA, route("a", "lan", "a.example", a))
-	dial("a.example")
-	rotated := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certA["b.example"]}
-	want, _ := os.ReadFile(rotated["a.example"].Cert)
-	apply(rotated, route("a", "lan", "a.example", a))
-	cs := dial("a.example")
-	if cs == nil || cs.DidResume || !strings.Contains(string(want), pemBody(cs.PeerCertificates[0].Raw)) {
-		t.Errorf("after rotation: %v, want a full handshake with the new certificate", cs)
 	}
 }
 

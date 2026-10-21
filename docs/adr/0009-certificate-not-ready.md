@@ -58,5 +58,4 @@ is enabled on the host, so on boot the files usually exist before genkan reads t
 
 ## Status
 
-Proposed, 2026-10-21 (review finding G2; implemented with this ADR, pending the owner's
-decision).
+Accepted — 2026-10-21

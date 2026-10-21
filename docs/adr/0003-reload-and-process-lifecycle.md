@@ -60,6 +60,14 @@ this one process.
   up on the old config, and a later restart would fail at startup.
 - Dependent units can `After=genkan.service` and trust it.
 
+### 2026-10-21: Session resumption
+
+Reloads preserve TLS sessions when the SNI remains configured with the same
+leaf certificate; removed names fail TLS, and changed certificates require a
+full handshake. Ticket keys rotate independently of reloads using Go defaults.
+See [ADR 0010](0010-reload-safe-session-resumption.md) for the binding and
+key-lifetime trade-offs (implemented for owner review).
+
 ## Status
 
 Accepted, 2026-10-12.

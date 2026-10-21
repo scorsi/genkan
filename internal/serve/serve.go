@@ -3,7 +3,7 @@ package serve
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -37,19 +37,38 @@ var (
 )
 
 // TLSConfig picks the certificate by SNI from hosts. An unknown or absent server name returns no
-// certificate, which crypto/tls answers with an unrecognized_name alert. Its session ticket key is
-// its own: a session never resumes past the reload that replaces it.
-func TLSConfig(hosts map[string]*tls.Certificate) *tls.Config {
+// certificate, which crypto/tls answers with an unrecognized_name alert. tickets owns Go's
+// automatically rotated keys and survives reloads; tickets are bound to the SNI and leaf certificate.
+func TLSConfig(hosts map[string]*tls.Certificate, tickets *tls.Config) *tls.Config {
+	bindings := make(map[string][]byte, len(hosts))
+	for host, cert := range hosts {
+		fingerprint := sha256.Sum256(cert.Certificate[0])
+		bindings[host] = append([]byte("genkan/session/v1\x00"+host+"\x00"), fingerprint[:]...)
+	}
 	c := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return hosts[strings.ToLower(hello.ServerName)], nil
 		},
+		WrapSession: func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+			ss.Extra = append(ss.Extra, bindings[strings.ToLower(cs.ServerName)])
+			return tickets.EncryptTicket(cs, ss)
+		},
+		UnwrapSession: func(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
+			ss, err := tickets.DecryptTicket(identity, cs)
+			if err != nil || ss == nil {
+				return nil, err
+			}
+			binding := bindings[strings.ToLower(cs.ServerName)]
+			for _, extra := range ss.Extra {
+				if len(binding) > 0 && slices.Equal(extra, binding) {
+					return ss, nil
+				}
+			}
+			return nil, nil // stale or unbound ticket: perform a full handshake
+		},
 	}
-	var key [32]byte
-	rand.Read(key[:])
-	c.SetSessionTicketKeys([][32]byte{key})
 	return c
 }
 
@@ -92,6 +111,7 @@ type state struct {
 	rt       *router.Router
 	hosts    map[string]*tls.Certificate
 	tls      *tls.Config // serves hosts
+	tickets  *tls.Config // key rotation is independent of reloads
 }
 
 // slot is one bound address. It survives reloads as long as some listener keeps its addr.
@@ -130,7 +150,11 @@ func (s *Server) Apply(cfg *config.Config) error {
 
 	states := map[string]*state{}
 	for _, l := range cfg.Listeners {
-		st, err := s.build(l.Name, cfg, certs)
+		tickets := new(tls.Config)
+		if sl := s.slots[l.Addr]; sl != nil {
+			tickets = sl.state.Load().tickets
+		}
+		st, err := s.build(l.Name, cfg, certs, tickets)
 		if err != nil {
 			return err
 		}
@@ -177,8 +201,8 @@ func (s *Server) Apply(cfg *config.Config) error {
 	return nil
 }
 
-func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*state, error) {
-	st := &state{listener: listener, rt: router.New(listener, s.log, cfg.Log.Access, s.metrics), hosts: map[string]*tls.Certificate{}}
+func (s *Server) build(listener string, cfg *config.Config, certs cert.Files, tickets *tls.Config) (*state, error) {
+	st := &state{listener: listener, rt: router.New(listener, s.log, cfg.Log.Access, s.metrics), hosts: map[string]*tls.Certificate{}, tickets: tickets}
 	for _, r := range cfg.Routes {
 		if !slices.Contains(r.Listeners, listener) {
 			continue
@@ -205,7 +229,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 			}
 		}
 	}
-	st.tls = TLSConfig(st.hosts)
+	st.tls = TLSConfig(st.hosts, tickets)
 	return st, nil
 }
 
