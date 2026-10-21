@@ -8,6 +8,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -105,6 +109,165 @@ func TestSlowBackendHeaders(t *testing.T) {
 		if body, err := do(t, front, "GET", nil); err != nil || body != "late" {
 			t.Errorf("h2=%v: got %q, %v; want late", h2, body, err)
 		}
+	}
+}
+
+// G1: informational output must not time out the wait for final backend headers.
+func TestInformationalResponseDeadline(t *testing.T) {
+	shortTimeout(t)
+	for _, h2 := range []bool{false, true} {
+		for _, code := range []int{http.StatusContinue, http.StatusEarlyHints} {
+			t.Run(fmt.Sprintf("h2=%t/status=%d", h2, code), func(t *testing.T) {
+				front, _, _ := proxied(t, func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(code)
+					time.Sleep(4 * ProgressTimeout)
+					io.WriteString(w, "late")
+				}, h2)
+				seen := make(chan int, 1)
+				req, _ := http.NewRequest("GET", front.URL, nil)
+				req.Host = "a.example"
+				req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+					Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+						seen <- code
+						return nil
+					},
+				}))
+				res, err := front.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer res.Body.Close()
+				body, err := io.ReadAll(res.Body)
+				if err != nil || res.StatusCode != 200 || string(body) != "late" {
+					t.Fatalf("final response: status=%d, body=%q, err=%v", res.StatusCode, body, err)
+				}
+				select {
+				case got := <-seen:
+					if got != code {
+						t.Fatalf("informational status=%d, want %d", got, code)
+					}
+				default:
+					t.Fatal("informational response was not forwarded")
+				}
+			})
+		}
+	}
+}
+
+// R1: net/http must not wait forever draining a body the handler never read.
+func TestUnreadRequestBody(t *testing.T) {
+	shortTimeout(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("home"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer backend.Close()
+	log := logging.New(io.Discard, nil)
+	m := metrics.New("test")
+	for name, handler := range map[string]http.Handler{
+		"static":    Static(root),
+		"unmatched": nil,
+		"proxy":     Proxy(mustURL(backend.URL), "lan", "a", log, m),
+		"empty":     http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		"flush": http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NewResponseController(w).Flush()
+		}),
+	} {
+		for _, framing := range []string{"Content-Length: 1", "Transfer-Encoding: chunked"} {
+			t.Run(name+"/"+framing, func(t *testing.T) {
+				r := New("lan", log, false, m)
+				if handler != nil {
+					r.Handle("a.example", "a", handler)
+				}
+				front := httptest.NewServer(r)
+				defer front.Close()
+				c, err := net.Dial("tcp", front.Listener.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(10 * ProgressTimeout))
+				fmt.Fprintf(c, "GET / HTTP/1.1\r\nHost: a.example\r\n%s\r\n\r\n", framing)
+				_, err = io.Copy(io.Discard, c)
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					t.Fatal("connection retained an unread request body until the client's deadline")
+				}
+			})
+		}
+	}
+}
+
+// R3: one chunk can make network progress without returning from Body.Read.
+func TestSlowChunkedUpstream(t *testing.T) {
+	shortTimeout(t)
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("h2=%t", h2), func(t *testing.T) {
+			front, _, _ := proxied(t, func(w http.ResponseWriter, r *http.Request) {
+				c, buf, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer c.Close()
+				buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n")
+				buf.Flush()
+				for range 20 {
+					time.Sleep(30 * time.Millisecond)
+					if _, err := c.Write([]byte("x")); err != nil {
+						return
+					}
+				}
+				io.WriteString(c, "\r\n0\r\n\r\n")
+			}, h2)
+			if body, err := do(t, front, "GET", nil); err != nil || body != strings.Repeat("x", 20) {
+				t.Fatalf("slow chunk: got %q, %v; want all 20 bytes", body, err)
+			}
+		})
+	}
+}
+
+// R3: body deadlines must not leak into a pooled connection's idle or next-header wait.
+func TestUpstreamKeepAliveDeadline(t *testing.T) {
+	shortTimeout(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			w.WriteHeader(http.StatusEarlyHints)
+			time.Sleep(2 * ProgressTimeout)
+		}
+		if r.URL.Path == "/empty" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+	defer transport.CloseIdleConnections()
+	var first net.Conn
+	for _, path := range []string{"/", "/slow", "/empty", "/slow"} {
+		req, _ := http.NewRequest("GET", backend.URL+path, nil)
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if first == nil {
+					first = info.Conn
+				} else if first != info.Conn || !info.Reused {
+					t.Error("upstream connection was not reused")
+				}
+			},
+		}))
+		res, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil || path != "/empty" && string(body) != "ok" {
+			t.Fatalf("%s: body=%q, err=%v", path, body, err)
+		}
+		time.Sleep(2 * ProgressTimeout)
 	}
 }
 

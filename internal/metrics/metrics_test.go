@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,8 +70,9 @@ func TestBlockedScrapeDoesNotBlockAccounting(t *testing.T) {
 	m := New("test")
 	unblock := make(chan struct{})
 	defer close(unblock)
-	go m.Write(blockingWriter(unblock))
-	time.Sleep(50 * time.Millisecond) // let Write reach the writer
+	entered := make(chan struct{})
+	go m.Write(&blockingWriter{entered: entered, unblock: unblock})
+	<-entered
 	done := make(chan struct{})
 	go func() {
 		m.Request("lan", "a", "GET", 200, 1, time.Millisecond)
@@ -83,9 +85,13 @@ func TestBlockedScrapeDoesNotBlockAccounting(t *testing.T) {
 	}
 }
 
-type blockingWriter chan struct{}
+type blockingWriter struct {
+	entered, unblock chan struct{}
+	once             sync.Once
+}
 
-func (w blockingWriter) Write(p []byte) (int, error) {
-	<-w
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.unblock
 	return len(p), nil
 }

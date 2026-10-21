@@ -313,7 +313,14 @@ func serveMetrics(addr string, log *slog.Logger, m *metrics.Registry) (stop func
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", m)
-	srv := newServer(mux, nil, logging.Std(log, func(string) string { return "http-error" }))
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A scrape writes one bounded buffer, not an unbounded proxy stream (ADR 0007/0008).
+		rc := http.NewResponseController(w)
+		rc.SetReadDeadline(time.Now().Add(router.ProgressTimeout)) // bound discarded request bodies too
+		rc.SetWriteDeadline(time.Now().Add(router.ProgressTimeout))
+		mux.ServeHTTP(w, r)
+	})
+	srv := newServer(h, nil, logging.Std(log, func(string) string { return "http-error" }))
 	go func() {
 		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			log.Error("", "event", "listener-stopped", "addr", addr, "err", err.Error())

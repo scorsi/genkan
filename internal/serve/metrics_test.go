@@ -1,8 +1,13 @@
 package serve
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -11,7 +16,40 @@ import (
 	"github.com/scorsi/genkan/internal/config"
 	"github.com/scorsi/genkan/internal/logging"
 	"github.com/scorsi/genkan/internal/metrics"
+	"github.com/scorsi/genkan/internal/router"
 )
+
+// G6: a loopback scraper that stops reading cannot retain a response writer indefinitely.
+func TestMetricsWriteDeadline(t *testing.T) {
+	old := router.ProgressTimeout
+	router.ProgressTimeout = 150 * time.Millisecond
+	defer func() { router.ProgressTimeout = old }()
+	// Force exposition beyond the socket buffers without thousands of metric series.
+	m := metrics.New(strings.Repeat("v", 16<<20))
+	addr := freeAddr(t)
+	stop, err := serveMetrics(addr, logging.New(io.Discard, nil), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(c, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	res, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	time.Sleep(4 * router.ProgressTimeout)
+	_, err = io.Copy(io.Discard, res.Body)
+	if ne, ok := err.(net.Error); err == nil || ok && ne.Timeout() {
+		t.Fatalf("stalled scrape: %v, want the response aborted by genkan", err)
+	}
+}
 
 // A failed handshake becomes a tls-handshake-error schema line and is counted on its listener;
 // the loaded certificate's expiry is exported.

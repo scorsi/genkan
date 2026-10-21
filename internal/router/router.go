@@ -2,6 +2,7 @@
 package router
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -9,10 +10,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,17 +32,17 @@ var (
 )
 
 // transport is shared by every proxy handler: the backends are few and local.
-var transport = &http.Transport{
+var transport = upstreamTransport{&http.Transport{
 	DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		c, err := (&net.Dialer{Timeout: DialTimeout}).DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return upstreamConn{c}, nil
+		return &upstreamConn{Conn: c, timeout: ProgressTimeout}, nil
 	},
 	MaxIdleConnsPerHost: 32,
 	IdleConnTimeout:     90 * time.Second,
-}
+}}
 
 // Router serves one listener: it picks the route by Host, writes one access record per request and
 // counts it.
@@ -67,22 +70,32 @@ func (r *Router) Handle(host, route string, h http.Handler) {
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
-	// Idle-based deadlines (ADR 0007), each on the direction in use only: the read deadline while a
-	// body Read is pending, the write deadline from the first byte of output on, pushed by progress
-	// in either direction. None waits on the backend's headers, and no read deadline is left for
-	// HTTP/1.1's background read. Clearing the write deadline drops the previous request's on a
-	// kept-alive HTTP/1.1 connection.
+	// Bound I/O, not backend processing or buffering between writes (ADR 0007).
 	rc := http.NewResponseController(w)
 	rc.SetWriteDeadline(time.Time{})
 	rec := &recorder{ResponseWriter: w, rc: rc, status: http.StatusOK}
-	req.Body = &progressReader{req.Body, rec}
+	// net/http must retain its original body to detect early Close and disable keep-alive.
+	req = req.WithContext(req.Context())
+	if req.Body != nil && req.Body != http.NoBody {
+		body := &progressReader{ReadCloser: req.Body, rc: rc}
+		req.Body = body
+		if req.ProtoMajor == 1 {
+			rec.input = body
+		}
+	}
 	e, ok := r.routes[hostOnly(req.Host)]
 	if !ok {
 		e.name = "-" // the log schema's "no route"
 	}
 	// Deferred: ReverseProxy aborts a response that fails mid-body by panicking with
 	// http.ErrAbortHandler; the request is still logged and counted, then the panic goes on.
-	defer r.done(req, e.name, rec, start)
+	defer func() {
+		if !rec.hijacked {
+			rec.closeInput()
+			rec.push() // net/http flushes its final buffered output after ServeHTTP returns
+		}
+		r.done(req, e.name, rec, start)
+	}()
 	if ok {
 		e.h.ServeHTTP(rec, req)
 	} else {
@@ -131,11 +144,6 @@ func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metric
 			pr.SetXForwarded()
 		},
 		Transport: transport,
-		// The wait for the headers is unbounded (ADR 0007); the body is not.
-		ModifyResponse: func(res *http.Response) error {
-			res.Body = newUpstreamBody(res.Body)
-			return nil
-		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			// A client that went away is not the backend's fault (httputil's default handler agrees).
 			if !errors.Is(err, context.Canceled) {
@@ -181,77 +189,131 @@ func hostOnly(hostport string) string {
 	return strings.ToLower(hostport)
 }
 
-// progressReader arms the read deadline for each Read of the request body only, and counts its
-// progress as the request's.
+// progressReader bounds explicit reads and net/http's bounded discard inside Close.
 type progressReader struct {
 	io.ReadCloser
-	rec *recorder
+	rc     *http.ResponseController
+	mu     sync.Mutex
+	closed bool
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
-	p.rec.rc.SetReadDeadline(time.Now().Add(ProgressTimeout))
-	n, err := p.ReadCloser.Read(b)
-	p.rec.rc.SetReadDeadline(time.Time{})
-	if n > 0 && p.rec.writing.Load() {
-		p.rec.push()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rc.SetReadDeadline(time.Now().Add(ProgressTimeout))
+	defer p.rc.SetReadDeadline(time.Time{})
+	return p.ReadCloser.Read(b)
+}
+
+func (p *progressReader) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
 	}
-	return n, err
+	p.closed = true
+	p.rc.SetReadDeadline(time.Now().Add(ProgressTimeout))
+	defer p.rc.SetReadDeadline(time.Time{})
+	return p.ReadCloser.Close()
 }
 
 type recorder struct {
 	http.ResponseWriter
-	rc      *http.ResponseController
-	writing atomic.Bool // output began: the write deadline is armed
-	status  int
-	bytes   int64
+	rc          *http.ResponseController
+	input       io.Closer // HTTP/1 body to close before net/http can drain it without a deadline
+	wroteHeader bool
+	hijacked    bool
+	status      int
+	bytes       int64
 }
 
-// push moves the write deadline. HTTP/2 resets a stream whose deadline passes even between
-// writes, so an upload still progressing pushes it too.
+func (r *recorder) closeInput() {
+	if r.input != nil {
+		r.input.Close() // net/http closes the connection if the original body did not reach EOF
+	}
+}
+
 func (r *recorder) push() { r.rc.SetWriteDeadline(time.Now().Add(ProgressTimeout)) }
 
 func (r *recorder) WriteHeader(code int) {
-	r.writing.Store(true)
+	if !r.wroteHeader && (code >= 200 || code == http.StatusSwitchingProtocols) {
+		r.closeInput()
+		r.wroteHeader = true
+		r.status = code
+	}
 	r.push()
-	r.status = code
+	defer r.rc.SetWriteDeadline(time.Time{})
 	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *recorder) Write(b []byte) (int, error) {
-	r.writing.Store(true)
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
 	r.push()
+	defer r.rc.SetWriteDeadline(time.Time{})
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += int64(n)
 	return n, err
 }
 
-// Unwrap lets http.ResponseController reach Flush and Hijack (streaming, WebSocket upgrades).
+func (r *recorder) FlushError() error {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	r.push()
+	defer r.rc.SetWriteDeadline(time.Time{})
+	return r.rc.Flush()
+}
+
+func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c, buf, err := r.rc.Hijack()
+	if err == nil {
+		r.hijacked = true
+	}
+	return c, buf, err
+}
+
+// Unwrap lets http.ResponseController reach other optional writer methods.
 func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// upstreamBody closes the backend's response body when one Read waits ProgressTimeout, which
-// aborts the response (the frontend deadlines cannot see a backend that stops sending).
-type upstreamBody struct {
-	io.ReadCloser
-	t *time.Timer
+// upstreamTransport enables read deadlines only after final headers, preserving the unlimited
+// header wait and the bidirectional body ReverseProxy needs for a 101 upgrade.
+type upstreamTransport struct{ *http.Transport }
+
+func (t upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body := new(atomic.Bool)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			info.Conn.(*upstreamConn).body.Store(body)
+		},
+		// A pooled connection may already belong to another request when this hook runs.
+		PutIdleConn: func(error) { body.Store(false) },
+	}))
+	res, err := t.Transport.RoundTrip(req)
+	if err == nil && res.Body != http.NoBody && res.StatusCode != http.StatusSwitchingProtocols {
+		body.Store(true)
+	}
+	return res, err
 }
 
-func newUpstreamBody(b io.ReadCloser) *upstreamBody {
-	t := time.AfterFunc(ProgressTimeout, func() { b.Close() })
-	t.Stop()
-	return &upstreamBody{b, t}
+// upstreamConn measures body inactivity below HTTP buffering, on each network Read.
+type upstreamConn struct {
+	net.Conn
+	timeout time.Duration
+	body    atomic.Pointer[atomic.Bool]
 }
 
-func (u *upstreamBody) Read(b []byte) (int, error) {
-	u.t.Reset(ProgressTimeout)
-	defer u.t.Stop()
-	return u.ReadCloser.Read(b)
+func (c *upstreamConn) Read(b []byte) (int, error) {
+	if body := c.body.Load(); body != nil && body.Load() {
+		c.SetReadDeadline(time.Now().Add(c.timeout))
+		defer c.SetReadDeadline(time.Time{})
+	}
+	return c.Conn.Read(b)
 }
 
-// upstreamConn cuts a write to a backend that consumes nothing for ProgressTimeout, such as an
-// upload it stopped reading. Reads are left alone: the headers may take long.
-type upstreamConn struct{ net.Conn }
-
-func (c upstreamConn) Write(b []byte) (int, error) {
-	c.SetWriteDeadline(time.Now().Add(ProgressTimeout))
+func (c *upstreamConn) Write(b []byte) (int, error) {
+	c.SetWriteDeadline(time.Now().Add(c.timeout))
+	defer c.SetWriteDeadline(time.Time{})
 	return c.Conn.Write(b)
 }

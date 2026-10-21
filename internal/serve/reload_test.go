@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -12,7 +13,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/scorsi/genkan/internal/config"
@@ -254,18 +254,21 @@ func TestResumptionAfterReload(t *testing.T) {
 				apply(certA, route("a", "lan", "a.example", a))
 				dial("a.example")
 				rotated := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certA["b.example"]}
-				want, _ := os.ReadFile(rotated["a.example"].Cert)
+				wantPEM, err := os.ReadFile(rotated["a.example"].Cert)
+				if err != nil {
+					t.Fatal(err)
+				}
+				leaf, _ := pem.Decode(wantPEM)
+				if leaf == nil || leaf.Type != "CERTIFICATE" {
+					t.Fatal("rotated certificate is not PEM")
+				}
+				want := sha256.Sum256(leaf.Bytes)
 				apply(rotated, route("a", "lan", "a.example", a))
 				cs := dial("a.example")
-				if cs == nil || cs.DidResume || !strings.Contains(string(want), pemBody(cs.PeerCertificates[0].Raw)) {
+				if cs == nil || cs.DidResume || sha256.Sum256(cs.PeerCertificates[0].Raw) != want {
 					t.Errorf("after rotation: %v, want a full handshake with the new certificate", cs)
 				}
 			})
 		}
 	}
-}
-
-// pemBody is the base64 body of der as PEM writes it, first line only.
-func pemBody(der []byte) string {
-	return strings.Split(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), "\n")[1]
 }
