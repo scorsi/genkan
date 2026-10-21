@@ -70,8 +70,12 @@ referenced by `routes[].certificate`.
 | `key` | string (path) | yes | | v0.1 | PEM private key. Never a value: a path to a file written by hanko or sops-nix. |
 
 Files are not opened by `validate` (they are secrets, absent at Nix build
-time). At start, an unreadable or unparsable pair is fatal; on SIGHUP it fails
-the reload and the previous set stays in use. At load, a certificate whose
+time). A pair that is not ready, a file missing or the key not matching the
+certificate (hanko has not issued it yet, or is between its two renames), is
+logged as `certificate-not-ready`: at start its hosts fail the handshake until a
+reload loads it, on SIGHUP the pair already loaded under that name stays
+(ADR 0009, proposed). Any other unreadable or unparsable pair is fatal at
+start; on SIGHUP it fails the reload and the previous set stays in use. At load, a certificate whose
 SANs do not cover every host of the routes that use it logs a warning, not an
 error, so a wildcard issued later does not block start.
 

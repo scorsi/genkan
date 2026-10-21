@@ -68,6 +68,39 @@
         in
         {
           default = self.packages.${system}.default;
+
+          # Unit wiring, evaluated only (runs on darwin too): start after hanko when it runs here, and
+          # restart on any change of the metrics address, whichever option sets it.
+          module-unit =
+            let
+              unit =
+                extra:
+                (lib.nixosSystem {
+                  modules = [
+                    self.nixosModules.default
+                    ./nix/example.nix
+                    extra
+                    { nixpkgs.hostPlatform = if lib.hasSuffix "-linux" system then system else "aarch64-linux"; }
+                  ];
+                }).config.systemd.services.genkan;
+              withHanko = unit {
+                options.services.hanko.enable = lib.mkEnableOption "a stand-in for hanko's module";
+                config.services.hanko.enable = true;
+              };
+              trigger = extra: (unit extra).restartTriggers;
+              none = trigger { };
+              option = trigger { services.genkan.metrics.listen = "127.0.0.1:9101"; };
+              raw = trigger { services.genkan.settings.metrics.listen = "127.0.0.1:9101"; };
+              moved = trigger { services.genkan.settings.metrics.listen = "127.0.0.1:9102"; };
+            in
+            assert lib.assertMsg (
+              lib.elem "hanko.service" withHanko.after && lib.elem "hanko.service" withHanko.wants
+            ) "genkan is not ordered after hanko";
+            assert lib.assertMsg (!lib.elem "hanko.service" (unit { }).after) "hanko ordering without hanko";
+            assert lib.assertMsg (
+              option == raw && none != raw && raw != moved
+            ) "metrics address changes do not all restart genkan";
+            (pkgsFor system).runCommand "genkan-module-unit" { } "touch $out";
         }
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           module = moduleConfig { };

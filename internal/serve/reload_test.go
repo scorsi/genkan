@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/scorsi/genkan/internal/config"
@@ -110,13 +111,16 @@ func TestReload(t *testing.T) {
 	}
 	running := s.slots[lan.Addr].state.Load()
 
-	// Failed reloads: missing certificate file, then an address already in use.
-	missing := map[string]config.Certificate{"b.example": {Cert: "/nonexistent", Key: "/nonexistent"}}
+	// Failed reloads: unparsable certificate file (a missing one is "not ready", TestCertificateNotReady),
+	// then an address already in use.
+	garbage := filepath.Join(t.TempDir(), "garbage.pem")
+	os.WriteFile(garbage, []byte("garbage"), 0o600)
+	unparsable := map[string]config.Certificate{"b.example": {Cert: garbage, Key: garbage}}
 	if err := s.Apply(&config.Config{
-		Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan}, Certificates: missing,
+		Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan}, Certificates: unparsable,
 		Routes: []config.Route{route("b", "lan", "b.example", b)},
 	}); err == nil {
-		t.Error("reload with a missing certificate succeeded")
+		t.Error("reload with an unparsable certificate succeeded")
 	}
 	busy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -175,4 +179,68 @@ func TestNotify(t *testing.T) {
 	if err := notify("READY=1"); err != nil {
 		t.Errorf("without NOTIFY_SOCKET: %v", err)
 	}
+}
+
+// G4: a TLS session resumed after a reload is checked against the current state: a removed name
+// does not resume, and a rotated certificate is the one served.
+func TestResumptionAfterReload(t *testing.T) {
+	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), new(slog.LevelVar), metrics.New("test"))
+	defer s.Shutdown(0)
+	lan := config.Listener{Name: "lan", Addr: freeAddr(t), Mode: "tls"}
+	a, b := backend(t, "A"), backend(t, "B")
+	apply := func(certs map[string]config.Certificate, routes ...config.Route) {
+		t.Helper()
+		if err := s.Apply(&config.Config{Log: config.Log{Level: "info"}, Listeners: []config.Listener{lan}, Certificates: certs, Routes: routes}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := tls.NewLRUClientSessionCache(8)
+	// dial does one request over a TLS 1.3 connection sharing cache; nil if the handshake fails.
+	dial := func(sni string) *tls.ConnectionState {
+		c, err := tls.Dial("tcp", lan.Addr, &tls.Config{ServerName: sni, InsecureSkipVerify: true, ClientSessionCache: cache, MinVersion: tls.VersionTLS13})
+		if err != nil {
+			return nil
+		}
+		defer c.Close()
+		io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+sni+"\r\nConnection: close\r\n\r\n")
+		io.ReadAll(c) // reads the session ticket too
+		cs := c.ConnectionState()
+		return &cs
+	}
+
+	certA := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certFiles(t, "b.example")}
+	apply(certA, route("a", "lan", "a.example", a), route("b", "lan", "b.example", b))
+	if dial("a.example") == nil {
+		t.Fatal("first handshake failed")
+	}
+	if c, err := tls.Dial("tcp", lan.Addr, &tls.Config{ServerName: "a.example", InsecureSkipVerify: true, NextProtos: []string{"h2"}}); err != nil || c.ConnectionState().NegotiatedProtocol != "h2" {
+		t.Errorf("HTTP/2 not offered: %v", err)
+	} else {
+		c.Close()
+	}
+	if cs := dial("a.example"); cs == nil || !cs.DidResume {
+		t.Fatal("session not resumed without a reload: the test proves nothing")
+	}
+
+	// a.example removed: its cached session must not reach the listener.
+	apply(certA, route("b", "lan", "b.example", b))
+	if cs := dial("a.example"); cs != nil {
+		t.Errorf("removed name resumed=%v", cs.DidResume)
+	}
+
+	// a.example back with a rotated certificate: the resumed session must not keep the old one.
+	apply(certA, route("a", "lan", "a.example", a))
+	dial("a.example")
+	rotated := map[string]config.Certificate{"a.example": certFiles(t, "a.example"), "b.example": certA["b.example"]}
+	want, _ := os.ReadFile(rotated["a.example"].Cert)
+	apply(rotated, route("a", "lan", "a.example", a))
+	cs := dial("a.example")
+	if cs == nil || cs.DidResume || !strings.Contains(string(want), pemBody(cs.PeerCertificates[0].Raw)) {
+		t.Errorf("after rotation: %v, want a full handshake with the new certificate", cs)
+	}
+}
+
+// pemBody is the base64 body of der as PEM writes it, first line only.
+func pemBody(der []byte) string {
+	return strings.Split(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), "\n")[1]
 }

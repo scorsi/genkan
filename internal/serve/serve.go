@@ -3,11 +3,13 @@ package serve
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,14 +36,38 @@ var (
 	IdleTimeout = 120 * time.Second
 )
 
-// TLSConfig picks the certificate by SNI from the map hosts returns at handshake time. An unknown
-// or absent server name returns no certificate, which crypto/tls answers with an unrecognized_name
-// alert.
-func TLSConfig(hosts func() map[string]*tls.Certificate) *tls.Config {
+// TLSConfig picks the certificate by SNI from hosts. An unknown or absent server name returns no
+// certificate, which crypto/tls answers with an unrecognized_name alert. Its session ticket key is
+// its own: a session never resumes past the reload that replaces it.
+func TLSConfig(hosts map[string]*tls.Certificate) *tls.Config {
+	c := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return hosts[strings.ToLower(hello.ServerName)], nil
+		},
+	}
+	var key [32]byte
+	rand.Read(key[:])
+	c.SetSessionTicketKeys([][32]byte{key})
+	return c
+}
+
+// unknownName serves no certificate and resumes no session: the handshake fails with
+// unrecognized_name, even for a client holding a ticket.
+var unknownName = &tls.Config{MinVersion: tls.VersionTLS12, SessionTicketsDisabled: true}
+
+// listenerTLS resolves every handshake, resumed ones included (they skip GetCertificate), against
+// the state current returns at that moment.
+func listenerTLS(current func() *state) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return hosts()[strings.ToLower(hello.ServerName)], nil
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			st := current()
+			if st.hosts[strings.ToLower(hello.ServerName)] == nil {
+				return unknownName, nil
+			}
+			return st.tls, nil
 		},
 	}
 }
@@ -65,6 +91,7 @@ type state struct {
 	listener string
 	rt       *router.Router
 	hosts    map[string]*tls.Certificate
+	tls      *tls.Config // serves hosts
 }
 
 // slot is one bound address. It survives reloads as long as some listener keeps its addr.
@@ -80,6 +107,7 @@ type Server struct {
 	level   *slog.LevelVar
 	metrics *metrics.Registry
 	slots   map[string]*slot // by listener addr
+	certs   cert.Files       // last applied; a pair not ready on reload keeps its entry here
 }
 
 // New returns a Server with nothing bound. Apply sets level from each config's log.level.
@@ -89,11 +117,15 @@ func New(log *slog.Logger, level *slog.LevelVar, m *metrics.Registry) *Server {
 
 // Apply loads cfg's certificates, builds every listener's routes and binds the addresses not yet
 // bound, then swaps all listeners at once and closes the addresses cfg dropped. An error leaves
-// the running config untouched (ADR 0003).
+// the running config untouched (ADR 0003). A certificate not ready is logged and its hosts fail
+// the handshake until a later reload loads it (ADR 0009).
 func (s *Server) Apply(cfg *config.Config) error {
-	certs, err := cert.Load(cfg.Certificates)
+	certs, notReady, err := cert.Load(cfg.Certificates, s.certs)
 	if err != nil {
 		return err
+	}
+	for _, name := range slices.Sorted(maps.Keys(notReady)) {
+		s.log.Warn("", "event", "certificate-not-ready", "certificate", name, "kept", certs[name] != nil, "err", notReady[name].Error())
 	}
 
 	states := map[string]*state{}
@@ -139,6 +171,7 @@ func (s *Server) Apply(cfg *config.Config) error {
 		}
 	}
 	s.slots = slots
+	s.certs = certs
 	s.level.UnmarshalText([]byte(cfg.Log.Level))
 	s.metrics.SetCertificates(certs.Expiry())
 	return nil
@@ -163,12 +196,16 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files) (*
 		}
 		for _, host := range r.Hosts {
 			st.rt.Handle(host, r.Name, h)
+			if certs[r.Certificate] == nil {
+				continue // not ready, logged by Apply
+			}
 			st.hosts[host] = certs[r.Certificate]
 			if !certs.Covers(r.Certificate, host) {
 				s.log.Warn("certificate does not cover host", "event", "certificate-mismatch", "certificate", r.Certificate, "host", host, "route", r.Name)
 			}
 		}
 	}
+	st.tls = TLSConfig(st.hosts)
 	return st, nil
 }
 
@@ -182,7 +219,7 @@ func (s *Server) start(sl *slot) {
 		}
 		return "http-error"
 	})
-	sl.srv = newServer(h, TLSConfig(func() map[string]*tls.Certificate { return sl.state.Load().hosts }), errorLog)
+	sl.srv = newServer(h, listenerTLS(sl.state.Load), errorLog)
 	go func() {
 		if err := sl.srv.ServeTLS(limit(sl.ln, MaxConns), "", ""); !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("", "event", "listener-stopped", "addr", sl.ln.Addr().String(), "err", err.Error())

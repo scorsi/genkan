@@ -63,3 +63,29 @@ genkan_certificate_expiry_timestamp_seconds{certificate="we\"ird"} 1
 		t.Errorf("got:\n%s", out.String())
 	}
 }
+
+// G6: a scrape whose client stops reading does not hold the lock request accounting needs.
+func TestBlockedScrapeDoesNotBlockAccounting(t *testing.T) {
+	m := New("test")
+	unblock := make(chan struct{})
+	defer close(unblock)
+	go m.Write(blockingWriter(unblock))
+	time.Sleep(50 * time.Millisecond) // let Write reach the writer
+	done := make(chan struct{})
+	go func() {
+		m.Request("lan", "a", "GET", 200, 1, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("request accounting blocked by a stalled scrape")
+	}
+}
+
+type blockingWriter chan struct{}
+
+func (w blockingWriter) Write(p []byte) (int, error) {
+	<-w
+	return len(p), nil
+}

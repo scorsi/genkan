@@ -14,3 +14,4 @@ change is a new ADR that supersedes the old one.
 | [0006](0006-service-identity-and-permissions.md) | Static system user, bind capability, read-only everything else | Accepted |
 | [0007](0007-exposure-limits.md) | Limits on public exposure: deadlines, idle timeouts, half-close, connection caps | Accepted |
 | [0008](0008-observability.md) | Observability: schema logs on stderr, loopback /metrics, journald rate limit | Accepted |
+| [0009](0009-certificate-not-ready.md) | A certificate pair not ready yet does not stop genkan | Proposed |

@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"io"
@@ -106,10 +107,17 @@ func (m *Registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.Write(w)
 }
 
-// Write writes every family, series sorted so the output is stable.
+// Write writes every family, series sorted so the output is stable. It renders under the lock
+// and writes after releasing it: a scraper that stops reading must not stall request accounting.
 func (m *Registry) Write(w io.Writer) {
+	var b bytes.Buffer
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.render(&b)
+	m.mu.Unlock()
+	w.Write(b.Bytes())
+}
+
+func (m *Registry) render(w io.Writer) {
 
 	family(w, "genkan_build_info", "gauge", "Build of the running binary.")
 	fmt.Fprintf(w, "genkan_build_info{version=%s} 1\n", q(m.version))

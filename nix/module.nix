@@ -13,6 +13,7 @@ let
   toml = pkgs.formats.toml { };
   exe = lib.getExe cfg.package;
   path = "/etc/genkan/genkan.toml";
+  hanko = lib.optional (config.services.hanko.enable or false) "hanko.service";
 
   # Certificate for a site: exact name first, then a wildcard on the first label.
   certFor =
@@ -216,12 +217,15 @@ in
     systemd.services.genkan = {
       description = "genkan reverse proxy";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      # hanko (a oneshot that stays active) has written its certificates before genkan reads them;
+      # a pair still missing then is "not ready", not fatal (ADR 0009). Only when hanko runs here.
+      wants = [ "network-online.target" ] ++ hanko;
+      after = [ "network-online.target" ] ++ hanko;
       # ExecStart reads /etc, so a config change reloads instead of restarting.
       reloadTriggers = [ configFile ];
-      # Except the metrics listener, which a reload does not move (ADR 0008).
-      restartTriggers = [ (toString cfg.metrics.listen) ];
+      # Except the metrics listener, which a reload does not move (ADR 0008): the merged value, so
+      # `settings.metrics.listen` restarts too.
+      restartTriggers = [ (cfg.settings.metrics.listen or "") ];
       serviceConfig = {
         Type = "notify";
         ExecStart = "${exe} run ${path}";

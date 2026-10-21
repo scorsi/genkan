@@ -1,6 +1,7 @@
 # NixOS VM test (milestone v0.3): genkan in front of one HTTP backend and one static root, two
 # hostnames, self-signed certificates. curl asserts routing, forwarding headers, unknown SNI, a
-# certificate rotation picked up by `systemctl reload`, and a failed reload that keeps serving.
+# certificate rotation picked up by `systemctl reload`, a failed reload that keeps serving, and a
+# certificate absent at boot that genkan starts without and serves once it appears (ADR 0009).
 # Then (ADR 0008) every line genkan wrote passes `nisshi validate --logs`, and /metrics passes
 # `masu validate --metrics` and counts the requests.
 self:
@@ -54,6 +55,7 @@ let
   '';
 
   dir = "/var/lib/hanko/test"; # where hanko writes, group genkan per certificate
+  late = "/var/lib/hanko/late"; # not issued yet at boot
 in
 pkgs.testers.runNixOSTest {
   name = "genkan";
@@ -86,7 +88,13 @@ pkgs.testers.runNixOSTest {
         cert = "${dir}/fullchain.pem";
         key = "${dir}/key.pem";
       };
+      certificates.late = {
+        hosts = [ "late.test" ];
+        cert = "${late}/fullchain.pem";
+        key = "${late}/key.pem";
+      };
       sites."app.test".backend = "http://127.0.0.1:8080";
+      sites."late.test".backend = "http://127.0.0.1:8080";
       sites."site.test".root = site;
       metrics.listen = metrics;
     };
@@ -104,9 +112,9 @@ pkgs.testers.runNixOSTest {
             f"-w ' %{{http_code}}' https://{host}{path}"
         )
 
-    def subject():
+    def subject(sni="app.test"):
         return machine.succeed(
-            "openssl s_client -connect 127.0.0.1:443 -servername app.test </dev/null 2>/dev/null"
+            f"openssl s_client -connect 127.0.0.1:443 -servername {sni} </dev/null 2>/dev/null"
             " | openssl x509 -noout -subject"
         )
 
@@ -129,6 +137,17 @@ pkgs.testers.runNixOSTest {
         machine.fail("curl -sS -k --resolve other.test:443:127.0.0.1 https://other.test/")
 
     pid = machine.succeed("systemctl show -P MainPID genkan").strip()
+
+    with subtest("a certificate missing at boot is not ready, then served after a reload"):
+        machine.wait_until_succeeds("journalctl _SYSTEMD_UNIT=genkan.service -o cat"
+                                    " | grep -F '\"event\":\"certificate-not-ready\",\"certificate\":\"late\"'")
+        machine.fail("curl -sS -k --resolve late.test:443:127.0.0.1 https://late.test/")
+        machine.succeed("install -d -m 2750 -g genkan ${late}")
+        machine.succeed("install -m 0640 -g genkan ${certs}/first.pem ${late}/fullchain.pem")
+        machine.succeed("install -m 0640 -g genkan ${certs}/first.key ${late}/key.pem")
+        machine.succeed("systemctl reload genkan")
+        machine.wait_until_succeeds("curl -sS -k --resolve late.test:443:127.0.0.1 https://late.test/")
+        assert "first" in subject("late.test")
 
     with subtest("reload picks up a rotated certificate"):
         assert "first" in subject()
