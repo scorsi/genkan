@@ -66,5 +66,4 @@ metadata without implementing ticket encryption or key rotation.
 
 ## Status
 
-Proposed — 2026-10-21; implemented for owner review under the conditional
-implementation request. Supplements ADR 0003's reload behaviour.
+Accepted — 2026-10-21. Supplements ADR 0003's reload behaviour.
