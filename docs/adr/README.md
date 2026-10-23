@@ -16,3 +16,4 @@ change is a new ADR that supersedes the old one.
 | [0008](0008-observability.md) | Observability: schema logs on stderr, loopback /metrics, journald rate limit | Accepted |
 | [0009](0009-certificate-not-ready.md) | A certificate pair not ready yet does not stop genkan | Accepted |
 | [0010](0010-reload-safe-session-resumption.md) | Certificate-bound session resumption across reloads | Accepted |
+| [0011](0011-quiet-paths.md) | Per-route quiet paths: successful polls are counted, not logged | Accepted |

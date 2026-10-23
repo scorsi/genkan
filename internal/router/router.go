@@ -55,17 +55,26 @@ type Router struct {
 }
 
 type entry struct {
-	name string
-	h    http.Handler
+	name  string
+	h     http.Handler
+	quiet map[string]bool // paths not logged when they succeed (ADR 0011)
 }
 
 func New(listener string, log *slog.Logger, access bool, m *metrics.Registry) *Router {
 	return &Router{listener: listener, log: log, access: access, metrics: m, routes: map[string]entry{}}
 }
 
-// Handle serves host (lowercase, no port) with h. route is the name used in logs.
-func (r *Router) Handle(host, route string, h http.Handler) {
-	r.routes[host] = entry{route, h}
+// Handle serves host (lowercase, no port) with h. route is the name used in logs. A request to
+// one of quiet (exact paths) that completes with a status below 400 is counted but not logged.
+func (r *Router) Handle(host, route string, h http.Handler, quiet ...string) {
+	e := entry{name: route, h: h}
+	for _, p := range quiet {
+		if e.quiet == nil {
+			e.quiet = map[string]bool{}
+		}
+		e.quiet[p] = true
+	}
+	r.routes[host] = e
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -90,6 +99,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	// Deferred: ReverseProxy aborts a response that fails mid-body by panicking with
 	// http.ErrAbortHandler; the request is still logged and counted, then the panic goes on.
+	returned := false // false while panicking: an aborted response is never quiet
 	defer func() {
 		if !rec.hijacked {
 			rec.closeInput()
@@ -98,19 +108,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if body != nil {
 			body.finish()
 		}
-		r.done(req, e.name, rec, start)
+		r.done(req, e.name, rec, start, returned && rec.status < 400 && e.quiet[req.URL.Path])
 	}()
 	if ok {
 		e.h.ServeHTTP(rec, req)
 	} else {
 		http.NotFound(rec, req)
 	}
+	returned = true
 }
 
-func (r *Router) done(req *http.Request, route string, rec *recorder, start time.Time) {
+func (r *Router) done(req *http.Request, route string, rec *recorder, start time.Time, quiet bool) {
 	d := time.Since(start)
 	r.metrics.Request(r.listener, route, req.Method, rec.status, rec.bytes, d)
-	if r.access {
+	if r.access && !quiet {
 		r.log.Info("",
 			"event", "request",
 			"listener", r.listener,

@@ -69,6 +69,10 @@ func TestInvalid(t *testing.T) {
 		{"tcp route without sni on tls", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nbackend = \"127.0.0.1:22\"\n", "sni is required on tls listeners"},
 		{"tcp listener with http route", strings.Replace(valid, `mode = "tls"`, `mode = "tcp"`, 1), `listener "lan" is tcp, only tcp routes may use it`},
 		{"tcp listener without route", valid + "\n[[listeners]]\nname = \"ssh\"\naddr = \":22\"\nmode = \"tcp\"\n", `listener "ssh": tcp mode needs exactly one route, has 0`},
+		{"quiet path relative", valid + "quiet_paths = [\"api/poll\"]\n", `quiet_paths "api/poll" must start with /`},
+		{"quiet path query", valid + "quiet_paths = [\"/poll?x=1\"]\n", `quiet_paths "/poll?x=1" must be a path`},
+		{"quiet path twice", valid + "quiet_paths = [\"/poll\", \"/poll\"]\n", `quiet_paths "/poll" listed twice`},
+		{"tcp quiet paths", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\nquiet_paths = [\"/\"]\n", "quiet_paths are only for http and static routes"},
 		{"bad type", strings.Replace(valid, `type = "http"`, `type = "grpc"`, 1), "type must be"},
 		{"public metrics", valid + "\n[metrics]\nlisten = \"0.0.0.0:9100\"\n", "metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>"},
 		{"metrics without port", valid + "\n[metrics]\nlisten = \"127.0.0.1\"\n", "metrics.listen"},
@@ -129,5 +133,15 @@ func TestWarnings(t *testing.T) {
 	errs, warns := c.Validate()
 	if len(errs) > 0 || len(warns) != 1 || !strings.Contains(warns[0], "certificates.unused") {
 		t.Errorf("errs=%v warns=%v", errs, warns)
+	}
+}
+
+func TestValidQuietPaths(t *testing.T) {
+	c, err := Parse(strings.NewReader(valid + "quiet_paths = [\"/api/actions/runner.v1.RunnerService/FetchTask\", \"/\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs, _ := c.Validate(); len(errs) > 0 || len(c.Routes[0].QuietPaths) != 2 {
+		t.Errorf("errs=%v quiet_paths=%q", errs, c.Routes[0].QuietPaths)
 	}
 }

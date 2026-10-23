@@ -56,6 +56,7 @@ type Route struct {
 	Root        string   `toml:"root"`
 	SNI         []string `toml:"sni"`
 	SendProxy   string   `toml:"send_proxy"`
+	QuietPaths  []string `toml:"quiet_paths"`
 }
 
 // Parse decodes TOML. Unknown keys are errors, one per key.
@@ -240,6 +241,18 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if r.SendProxy != "" {
 				bad("%s: send_proxy is only for tcp routes", where)
 			}
+			quiet := map[string]bool{}
+			for _, p := range r.QuietPaths {
+				switch {
+				case !strings.HasPrefix(p, "/"):
+					bad("%s: quiet_paths %q must start with /", where, p)
+				case strings.ContainsAny(p, "?#"):
+					bad("%s: quiet_paths %q must be a path, without query or fragment", where, p)
+				case quiet[p]:
+					bad("%s: quiet_paths %q listed twice", where, p)
+				}
+				quiet[p] = true
+			}
 			if r.Type == "http" {
 				if err := checkBackendURL(r.Backend); err != nil {
 					bad("%s: backend %q %s", where, r.Backend, err)
@@ -266,8 +279,8 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if r.SendProxy != "" && r.SendProxy != "v2" {
 				bad("%s: send_proxy must be \"v2\", got %q", where, r.SendProxy)
 			}
-			if len(r.Hosts) > 0 || r.Certificate != "" || r.Root != "" {
-				bad("%s: hosts, certificate and root are only for http and static routes", where)
+			if len(r.Hosts) > 0 || r.Certificate != "" || r.Root != "" || len(r.QuietPaths) > 0 {
+				bad("%s: hosts, certificate, root and quiet_paths are only for http and static routes", where)
 			}
 			bad("%s: tcp routes not implemented before v1", where)
 		default:

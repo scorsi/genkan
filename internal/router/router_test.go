@@ -214,3 +214,75 @@ func mustURL(s string) *url.URL {
 	}
 	return u
 }
+
+// A quiet path is not logged when it succeeds (ADR 0011), still logged when it fails, and still
+// counted; other paths of the route are logged as usual.
+func TestQuietPaths(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Fail") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		fmt.Fprint(w, "{}")
+	}))
+	defer backend.Close()
+	var logs bytes.Buffer
+	log := logging.New(&logs, slog.LevelInfo)
+	m := metrics.New("test")
+	r := New("lan", log, true, m)
+	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m), "/poll")
+	r.Handle("b.example", "b", Proxy(mustURL("http://127.0.0.1:1"), "lan", "b", log, m), "/poll")
+
+	tests := []struct {
+		host, path string
+		fail       bool
+		status     int
+		logged     bool
+	}{
+		{"a.example", "/poll?x=1", false, 200, false},
+		{"a.example", "/poll", true, 500, true},
+		{"a.example", "/other", false, 200, true},
+		{"a.example", "/poll/", false, 200, true},
+		{"b.example", "/poll", false, 502, true}, // upstream error
+	}
+	for _, tt := range tests {
+		logs.Reset()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "http://"+tt.host+tt.path, nil)
+		if tt.fail {
+			req.Header.Set("Fail", "1")
+		}
+		r.ServeHTTP(rec, req)
+		logged := strings.Contains(logs.String(), `"event":"request"`)
+		if rec.Code != tt.status || logged != tt.logged {
+			t.Errorf("%s%s: got %d logged=%v, want %d logged=%v: %s", tt.host, tt.path, rec.Code, logged, tt.status, tt.logged, logs.String())
+		}
+	}
+	var out strings.Builder
+	m.Write(&out)
+	for _, want := range []string{
+		`genkan_requests_total{listener="lan",route="a",method="POST",code="2xx"} 3`,
+		`genkan_requests_total{listener="lan",route="a",method="POST",code="5xx"} 1`,
+	} {
+		if !strings.Contains(out.String(), want+"\n") {
+			t.Errorf("metrics lack %s:\n%s", want, out.String())
+		}
+	}
+}
+
+// A response that fails mid-body (ReverseProxy panics with http.ErrAbortHandler) on a quiet path
+// is still logged, though its status was 200.
+func TestQuietPathAbort(t *testing.T) {
+	var logs bytes.Buffer
+	r := New("lan", logging.New(&logs, slog.LevelInfo), true, metrics.New("test"))
+	r.Handle("a.example", "a", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("partial"))
+		panic(http.ErrAbortHandler)
+	}), "/poll")
+	func() {
+		defer func() { recover() }()
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://a.example/poll", nil))
+	}()
+	if !strings.Contains(logs.String(), `"event":"request"`) {
+		t.Error("aborted quiet request not logged")
+	}
+}

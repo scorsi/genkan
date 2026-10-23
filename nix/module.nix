@@ -50,6 +50,7 @@ let
         hosts = [ host ];
         certificate = certFor host site;
       }
+      // lib.optionalAttrs (site.quietPaths != [ ]) { quiet_paths = site.quietPaths; }
       // (
         if site.root != null then
           {
@@ -154,6 +155,15 @@ in
               type = types.nullOr types.str;
               default = null;
               description = "Certificate name; null picks the one whose hosts match, exact name before wildcard.";
+            };
+            quietPaths = mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              example = [ "/api/actions/runner.v1.RunnerService/FetchTask" ];
+              description = ''
+                Exact request paths (no query) whose `request` line is not written when the status is
+                below 400; failures are still logged, metrics count them all (ADR 0011).
+              '';
             };
           };
         }

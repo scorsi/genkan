@@ -24,7 +24,8 @@ from `validate` alike. Access records are `"event":"request"` and carry:
 listener, route (`-` when none matched), client address (from the PROXY header
 on `accept_proxy` listeners, otherwise the TCP peer), method, host, path
 (no query string), proto, TLS version, status, response body bytes, `dur_us`,
-user agent. No IP anonymisation.
+user agent. No IP anonymisation. A route's `quiet_paths` drops the records of
+its successful requests to those paths (ADR 0011).
 
 ## `[metrics]`
 
@@ -96,6 +97,7 @@ What a connection or request is forwarded to. Common keys:
 | `hosts` | list of strings | yes, non-empty | Hostnames, lowercase, no port, no wildcard in v0 (wildcards: v1.2). Matched case-insensitively against SNI and against `Host` with any port stripped. Each host may appear in only one route per listener. |
 | `certificate` | string | yes | Name of a `[certificates.<name>]` entry. |
 | `backend` | string (URL) | yes | `http://host:port` only. No path, query or userinfo. `https://` backends and Unix sockets are not supported. |
+| `quiet_paths` | list of strings | no | Exact request paths (`URL.Path`, matched case-sensitively, no query, no glob) whose `request` record is not written when the response completes with a status below 400 (ADR 0011). Failures (4xx, 5xx, `502` on upstream error, a response aborted mid-body) are still logged; metrics count every request. Each path starts with `/`, has no `?` or `#`, and appears once. Default: none. |
 
 Behaviour: requests are forwarded with `net/http/httputil.ReverseProxy`. The
 backend receives the client's `Host` unchanged (as Caddy does), so a backend
@@ -112,6 +114,7 @@ from clients work through stdlib defaults and are tested from v1.2.
 |---|---|---|---|
 | `hosts` | list of strings | yes, non-empty | As for `http`. |
 | `certificate` | string | yes | As for `http`. |
+| `quiet_paths` | list of strings | no | As for `http`. |
 | `root` | string (path) | yes | Absolute directory. Served with `http.FileServer`: `index.html` for a directory, `404` otherwise. Directory listing is disabled. No SPA fallback. |
 
 ### `type = "tcp"` (v1.0)
@@ -138,7 +141,8 @@ from clients work through stdlib defaults and are tested from v1.2.
 - the same host or SNI name claimed twice on one listener, across all route
   types;
 - `backend` not an `http://` URL (http) or not `host:port` (tcp); `root` not
-  absolute; a host containing `*` (before v1.2), a port, or uppercase letters;
+  absolute; a `quiet_paths` entry not starting with `/`, containing `?` or
+  `#`, or listed twice; `quiet_paths` on a `tcp` route; a host containing `*` (before v1.2), a port, or uppercase letters;
 - in v0: any `tcp` route, `accept_proxy`, `send_proxy`, or `http` listener
   ("not implemented before v1").
 

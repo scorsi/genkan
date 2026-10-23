@@ -219,7 +219,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files, ti
 			h = router.Static(r.Root)
 		}
 		for _, host := range r.Hosts {
-			st.rt.Handle(host, r.Name, h)
+			st.rt.Handle(host, r.Name, h, r.QuietPaths...)
 			if certs[r.Certificate] == nil {
 				continue // not ready, logged by Apply
 			}

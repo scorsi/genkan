@@ -15,6 +15,7 @@
     sites."git.home.example.org" = {
       backend = "http://127.0.0.1:3000";
       listeners = [ "lan" ];
+      quietPaths = [ "/api/actions/runner.v1.RunnerService/FetchTask" ];
     };
     sites."site.home.example.org".root = "/var/www/site";
   };
