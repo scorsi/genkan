@@ -52,6 +52,7 @@ type Router struct {
 	access   bool
 	metrics  *metrics.Registry
 	routes   map[string]entry
+	fallback *entry        // serves the hosts routes lacks; nil: 404
 	budget   chan struct{} // in-flight requests on the listener, shared across reloads; nil: unbounded
 }
 
@@ -78,6 +79,9 @@ func (r *Router) Handle(host, route string, h http.Handler, quiet ...string) {
 	r.routes[host] = e
 }
 
+// Default serves every host Handle did not register with h, logged as route.
+func (r *Router) Default(route string, h http.Handler) { r.fallback = &entry{name: route, h: h} }
+
 // Budget bounds the requests in flight through r with slots: one is held from routing to the end
 // of the response, and a request finding none free is answered 503 at once, without waiting.
 func (r *Router) Budget(slots chan struct{}) { r.budget = slots }
@@ -99,6 +103,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	e, ok := r.routes[hostOnly(req.Host)]
+	if !ok && r.fallback != nil {
+		e, ok = *r.fallback, true
+	}
 	if !ok {
 		e.name = "-" // the log schema's "no route"
 	}
@@ -187,6 +194,26 @@ func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metric
 		// What ReverseProxy still logs itself: a copy error once the response has started.
 		ErrorLog: logging.Std(log, func(string) string { return "proxy-error" }),
 	}
+}
+
+// Redirect answers every request 301 to https:// on the request's host, port dropped (443), same
+// path and query, whatever the method. A request without a usable Host gets 400.
+func Redirect() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		host := strings.ToLower((&url.URL{Host: req.Host}).Hostname())
+		if host == "" {
+			http.Error(w, "missing Host", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]" // IPv6 literal
+		}
+		uri := req.URL.RequestURI()
+		if !strings.HasPrefix(uri, "/") { // an opaque request URI; net/http answers OPTIONS * itself
+			uri = "/"
+		}
+		http.Redirect(w, req, "https://"+host+uri, http.StatusMovedPermanently)
+	})
 }
 
 // Static serves the files under root: index.html for a directory, 404 for a directory without one

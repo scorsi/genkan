@@ -106,7 +106,8 @@ func (h helloConn) Write(b []byte) (int, error) { return len(b), nil }
 
 // dispatch routes one accepted connection with the listener's state at accept: a whole tcp
 // listener, or a tls listener's SNI, goes to its tcp route; other ClientHellos go to the TLS
-// server, and on a listener with no http or static route they are closed instead.
+// server, and on a listener with no http or static route they are closed instead. An http
+// listener's connections go to the plaintext server.
 func (s *Server) dispatch(sl *slot, raw net.Conn) {
 	st := sl.state.Load()
 	start := time.Now()
@@ -137,7 +138,11 @@ func (s *Server) dispatch(sl *slot, raw net.Conn) {
 		// tls-handshake-error (a plaintext HTTP request still gets net/http's 400).
 	}
 	raw.SetReadDeadline(time.Time{})
-	if !ok {
+	switch {
+	case st.mode == "http":
+		sl.plainHandoff.push(c)
+		return
+	case !ok:
 		sl.handoff.push(c)
 		return
 	}

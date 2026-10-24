@@ -137,9 +137,7 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			addrs[l.Addr] = l.Name
 		}
 		switch l.Mode {
-		case "tls", "tcp":
-		case "http":
-			bad("%s: mode \"http\" not implemented before v1.1", where)
+		case "tls", "tcp", "http":
 		default:
 			bad("%s: mode must be tls, tcp or http, got %q", where, l.Mode)
 		}

@@ -137,7 +137,11 @@ type slot struct {
 	lim     *limitListener
 	handoff *handoff // what srv serves: the connections whose TLS genkan terminates
 	srv     *http.Server
-	state   atomic.Pointer[state]
+	// The plaintext side, for an http listener. Every slot has both, so a reload may change a
+	// listener's mode without rebinding its address.
+	plainHandoff *handoff
+	plain        *http.Server
+	state        atomic.Pointer[state]
 
 	mu     sync.Mutex
 	conns  map[*conn]net.Conn // passthrough client → backend
@@ -169,6 +173,7 @@ func (sl *slot) untrack(c *conn) {
 func (sl *slot) stop(shut func(*http.Server)) {
 	sl.lim.Close()
 	shut(sl.srv)
+	shut(sl.plain)
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 	sl.closed = true
@@ -309,6 +314,9 @@ func (s *Server) build(l config.Listener, cfg *config.Config, certs cert.Files, 
 			}
 		}
 	}
+	if l.Mode == "http" {
+		st.rt.Default("-", router.Redirect()) // no route: config forbids routes on http listeners
+	}
 	st.tls = TLSConfig(st.hosts, tickets)
 	return st, nil
 }
@@ -324,13 +332,27 @@ func (s *Server) start(sl *slot) {
 		return "http-error"
 	})
 	sl.srv = newServer(h, listenerTLS(sl.state.Load), errorLog)
+	sl.plain = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := sl.state.Load()
+		if st.mode != "http" {
+			// A keep-alive connection from before a reload made this listener tls or tcp: never
+			// route plaintext to a TLS listener's backends.
+			w.Header().Set("Connection", "close")
+			http.Error(w, "listener changed", http.StatusMisdirectedRequest)
+			return
+		}
+		st.rt.ServeHTTP(w, r)
+	}), nil, errorLog)
 	sl.lim = limit(sl.ln, MaxConns)
 	sl.handoff = newHandoff(sl.ln.Addr())
-	go func() {
-		if err := sl.srv.ServeTLS(sl.handoff, "", ""); !errors.Is(err, http.ErrServerClosed) {
+	sl.plainHandoff = newHandoff(sl.ln.Addr())
+	stopped := func(err error) {
+		if !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("", "event", "listener-stopped", "addr", sl.ln.Addr().String(), "err", err.Error())
 		}
-	}()
+	}
+	go func() { stopped(sl.srv.ServeTLS(sl.handoff, "", "")) }()
+	go func() { stopped(sl.plain.Serve(sl.plainHandoff)) }()
 	go func() {
 		for {
 			c, err := sl.lim.Accept()

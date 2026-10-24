@@ -47,7 +47,8 @@ func TestInvalid(t *testing.T) {
 		{"dup addr", valid + "\n[[listeners]]\nname = \"lan2\"\naddr = \"[::1]:8443\"\nmode = \"tls\"\n", `addr "[::1]:8443" already used`},
 		{"bad addr", strings.Replace(valid, `"[::1]:8443"`, `"8443"`, 1), "is not host:port"},
 		{"bad mode", strings.Replace(valid, `mode = "tls"`, `mode = "udp"`, 1), "mode must be"},
-		{"http listener", strings.Replace(valid, `mode = "tls"`, `mode = "http"`, 1), `mode "http" not implemented before v1.1`},
+		{"route on http listener", strings.Replace(valid, `mode = "tls"`, `mode = "http"`, 1), `routes cannot reference http listener "lan"`},
+		{"accept_proxy on http", valid + "\n[[listeners]]\nname = \"redirect\"\naddr = \":80\"\nmode = \"http\"\naccept_proxy = \"required\"\ntrusted_sources = [\"fd42::1/128\"]\n", `listener "redirect": accept_proxy on an http listener`},
 		{"accept_proxy v1", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"v1\"\ntrusted_sources = [\"fd42::1/128\"]", 1), `accept_proxy must be "required"`},
 		{"accept_proxy without sources", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"required\"", 1), "accept_proxy needs a non-empty trusted_sources"},
 		{"sources without accept_proxy", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\ntrusted_sources = [\"fd42::1/128\"]", 1), "trusted_sources without accept_proxy"},
@@ -119,6 +120,16 @@ func TestValidMetrics(t *testing.T) {
 		if errs, _ := c.Validate(); len(errs) > 0 || c.Metrics.Listen != addr {
 			t.Errorf("%s: errs=%v listen=%q", addr, errs, c.Metrics.Listen)
 		}
+	}
+}
+
+func TestValidHTTP(t *testing.T) {
+	c, err := Parse(strings.NewReader(valid + "\n[[listeners]]\nname = \"redirect\"\naddr = \":80\"\nmode = \"http\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs, warns := c.Validate(); len(errs) > 0 || len(warns) > 0 {
+		t.Errorf("errs=%v warns=%v", errs, warns)
 	}
 }
 
