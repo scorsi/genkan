@@ -5,7 +5,7 @@
 }:
 buildGoModule (finalAttrs: {
   pname = "genkan";
-  version = "0.2.0-dev";
+  version = "1.1.0";
   inherit src;
 
   # Changes whenever go.sum does: set to lib.fakeHash and read the new value from the build error.
