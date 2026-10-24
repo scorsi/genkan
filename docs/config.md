@@ -9,8 +9,8 @@ genkan validate <file>   # exit 0 if valid, 1 with one message per problem
 genkan run <file>        # SIGHUP re-reads the same path (ADR 0003)
 ```
 
-"Since" says which milestone implements a key. Keys marked v1 are parsed in
-v0 and rejected by `validate` with "not implemented before v1".
+"Since" says which milestone implements a key. `mode = "http"` (v1.1) is
+parsed and rejected by `validate` with "not implemented before v1.1".
 
 ## `[log]`
 
@@ -27,6 +27,14 @@ on `accept_proxy` listeners, otherwise the TCP peer), method, host, path
 user agent. No IP anonymisation. A route's `quiet_paths` drops the records of
 its successful requests to those paths (ADR 0011).
 
+L4 passthrough (ADR 0012) writes `"event":"connection"` when a forwarded
+connection ends: listener, route, client address (from the PROXY header on
+`accept_proxy` listeners), `sni` (`-` on a `tcp` listener), `bytes_in` (client
+to backend), `bytes_out`, `dur_us`; also subject to `access`. A connection
+closed before routing writes an info `"event":"connection-rejected"` with
+listener, client and `reason` (`untrusted-peer`, `proxy-header`, `client-hello`,
+`unknown-sni`), counted in `genkan_connections_rejected_total`. A failed backend dial is an `upstream-error`.
+
 ## `[metrics]`
 
 | Key | Type | Required | Default | Since | Notes |
@@ -42,7 +50,7 @@ A socket genkan binds. At least one is required.
 | `name` | string | yes | | v0.1 | Unique. Referenced by `routes[].listeners`. |
 | `addr` | string | yes | | v0.1 | Go `host:port`. `":443"` binds all addresses, dual stack. IPv6 in brackets: `"[fd42::10]:443"`. Unique across listeners. |
 | `mode` | string | yes | | v0.1 | `tls`, `tcp`, or `http`. See below. |
-| `accept_proxy` | string | no | absent | v1.0 | Only `"required"`. Every connection must begin with a PROXY protocol v2 header; a connection without one, or from a peer outside `trusted_sources`, is closed before any byte is read. When absent, a PROXY header is treated as garbage and the connection fails like any malformed ClientHello. |
+| `accept_proxy` | string | no | absent | v1.0 | Only `"required"`. A peer outside `trusted_sources` is closed before any byte is read; then every connection must begin with a PROXY protocol v2 header, or is closed (no header, a v1 header, a malformed one). The header's source address is the client from then on: access logs, `X-Forwarded-For`, an onward `send_proxy`. A `LOCAL` header keeps the peer address. When absent, a PROXY header is treated as garbage: on a `tls` listener the connection fails like any malformed ClientHello, on a `tcp` listener it is forwarded like any other bytes. |
 | `trusted_sources` | list of CIDR strings | when `accept_proxy` is set | | v1.0 | Peer addresses allowed to send PROXY headers. Must be non-empty when `accept_proxy` is set, must be absent otherwise. |
 
 Modes:
@@ -52,7 +60,9 @@ Modes:
   bytes already read, is forwarded to that route's backend (v1.0). Otherwise
   genkan terminates TLS with the certificate of the `http`/`static` route
   whose `hosts` contain the SNI, then routes the request by `Host`. No SNI,
-  or an SNI matching no route, fails the handshake with `unrecognized_name`.
+  or an SNI matching no route, fails the handshake with `unrecognized_name`;
+  on a listener with only `tcp` routes the connection is closed instead,
+  without an alert.
 - **`tcp`** (v1.0): no inspection. Exactly one `tcp` route without `sni`
   must reference this listener; every connection goes to its backend.
 - **`http`** (v1.1): plaintext HTTP. Every request is answered `301` to
@@ -122,7 +132,7 @@ from clients work through stdlib defaults and are tested from v1.2.
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `sni` | list of strings | depends on listener mode | Server names, lowercase, exact. Required and non-empty when every referenced listener is `tls`; forbidden when any is `tcp`. A name may appear in only one route per listener, and never also in an `http`/`static` route's `hosts` on the same listener. |
-| `backend` | string | yes | `host:port`. The raw stream is copied both ways until either side closes. |
+| `backend` | string | yes | `host:port`. The raw stream is copied both ways; a half-close is passed on and the other direction goes on until it ends too, or until both directions are idle for 1 h. Established connections keep their backend across reloads; a removed listener closes them. |
 | `send_proxy` | string | no | Only `"v2"`. Prefix the backend connection with a PROXY protocol v2 header carrying the client address genkan trusts. Forbidden on `http` and `static` routes. |
 
 ## Validation rules
@@ -139,12 +149,12 @@ from clients work through stdlib defaults and are tested from v1.2.
   route, or with a route that is not `tcp`, or with a `tcp` route that has
   `sni`;
 - the same host or SNI name claimed twice on one listener, across all route
-  types;
+  types; a `tcp` route whose listeners mix `tls` and `tcp` modes; an `sni`
+  name with uppercase letters, a port or `*`;
 - `backend` not an `http://` URL (http) or not `host:port` (tcp); `root` not
   absolute; a `quiet_paths` entry not starting with `/`, containing `?` or
   `#`, or listed twice; `quiet_paths` on a `tcp` route; a host containing `*` (before v1.2), a port, or uppercase letters;
-- in v0: any `tcp` route, `accept_proxy`, `send_proxy`, or `http` listener
-  ("not implemented before v1").
+- an `http` listener ("not implemented before v1.1").
 
 A certificate that is declared but never referenced is a warning.
 
@@ -156,8 +166,9 @@ handshake and request headers, 60 s without progress on a request body or a
 response, 120 s HTTP
 keep-alive idle, 5 s to dial a backend, 5 s to receive a ClientHello or PROXY
 header on peeking listeners, 1 h idle on L4 passthrough, 4096 concurrent
-connections per listener, TLS 1.2 minimum. A key is added only when a real
-backend needs a different value.
+connections per listener, 4096 requests in flight per listener (503 above,
+ADR 0014), 100 concurrent HTTP/2 streams per connection, TLS 1.2 minimum. A
+key is added only when a real backend needs a different value.
 
 ## Minimal example (v0.1, homelab)
 

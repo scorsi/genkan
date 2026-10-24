@@ -7,7 +7,8 @@ over an overlay network, and a NixOS module that generates all of its
 configuration.
 
 Status: v0.1 done; v0.2 (SIGHUP reload, sd_notify, NixOS module) implemented,
-awaiting deployment; v0.3 (static routes) implemented. Decisions live in [`docs/adr/`](docs/adr/),
+awaiting deployment; v0.3 (static routes) implemented; v1.0 (SNI passthrough,
+PROXY protocol) implemented, VM test pending on builder. Decisions live in [`docs/adr/`](docs/adr/),
 the plan in [`docs/milestones.md`](docs/milestones.md), the config reference in [`docs/config.md`](docs/config.md).
 
 ## Shape
@@ -26,8 +27,9 @@ the plan in [`docs/milestones.md`](docs/milestones.md), the config reference in 
 Nix flake: package, `nixosModules.default`, devShell, checks. `nix flake
 check` runs `go vet` and the unit tests, and on Linux builds the validated
 config of [`nix/example.nix`](nix/example.nix), checks that a typo in it
-fails the build, and runs the NixOS VM test of
-[`nix/vm-test.nix`](nix/vm-test.nix) (Linux builder only: Forgejo CI); `nix develop` gives `go` and `gopls`; `nix fmt` formats the
+fails the build, and runs the NixOS VM tests of
+[`nix/vm-test.nix`](nix/vm-test.nix) and [`nix/vm-test-edge.nix`](nix/vm-test-edge.nix)
+(Linux builder only: Forgejo CI); `nix develop` gives `go` and `gopls`; `nix fmt` formats the
 Nix files.
 
 ## NixOS module
@@ -54,6 +56,35 @@ does hanko after writing a certificate (genkan re-reads the files on SIGHUP and
 never watches them). The service reads hanko's files through its own group: hanko's
 per-certificate `group` must be `genkan`. No `security.acme`, no state
 directory.
+
+The two v1.0 roles (ADR 0002):
+
+```nix
+# Edge: public HTTPS by SNI, raw, with the client address in a PROXY v2 header; git SSH by port.
+services.genkan = {
+  enable = true;
+  listeners.public-https.address = ":443";
+  listeners.public-ssh.address = ":2222";
+  passthrough.homelab-https = {
+    listener = "public-https";
+    sni = [ "git.example.org" ];
+    backend = "[fd42::10]:8443";
+    sendProxy = true;
+  };
+  passthrough.git-ssh = { listener = "public-ssh"; backend = "[fd42::10]:2222"; }; # no sni: tcp listener
+};
+
+# Homelab: the overlay listener fed by the edge. Sites are served there only when they name it.
+services.genkan = {
+  listeners.lan.address = "[fd42::10]:443";
+  listeners.edge = {
+    address = "[fd42::10]:8443";
+    acceptProxy = true;
+    trustedSources = [ "fd42::1/128" ];
+  };
+  sites."git.example.org" = { backend = "http://127.0.0.1:3000"; listeners = [ "lan" "edge" ]; };
+};
+```
 
 ## License
 

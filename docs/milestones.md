@@ -88,6 +88,9 @@ the homelab host, its previous server retired.
 
 ### v1.0 L4 passthrough and PROXY protocol
 
+Status: implemented, VM test pending on builder (`checks.<linux>.vm-edge`).
+Decisions left open by the ADRs are Proposed in ADRs 0012 to 0015.
+
 Deliverable: genkan on the edge forwards public HTTPS by SNI and SSH by port to
 the homelab over kekkai; the homelab instance accepts PROXY protocol on a
 dedicated overlay listener.
