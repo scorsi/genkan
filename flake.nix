@@ -119,6 +119,7 @@
                   listener = "public-ssh";
                   backend = "[fd42::10]:2222";
                 };
+                services.genkan.httpRedirect.enable = true;
               };
             in
             assert lib.assertMsg (
@@ -166,6 +167,16 @@
                   "public-https"
                 ]
             ) "passthrough routes or listener modes are wrong";
+            # v1.1: the redirect listener is http on :80, absent unless enabled, and no route uses it.
+            assert lib.assertMsg (
+              listenerOf edge "http-redirect" == {
+                name = "http-redirect";
+                addr = ":80";
+                mode = "http";
+              }
+              && listenerOf homelab "http-redirect" == null
+              && !lib.any (r: lib.elem "http-redirect" r.listeners) edge.routes
+            ) "the redirect listener is wrong";
             (pkgsFor system).runCommand "genkan-module-unit" { } "touch $out";
         }
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {

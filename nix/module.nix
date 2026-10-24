@@ -46,18 +46,25 @@ let
   );
 
   generated = {
-    listeners = lib.mapAttrsToList (
-      name: l:
-      {
-        inherit name;
-        addr = l.address;
-        mode = modeOf name;
-      }
-      // lib.optionalAttrs l.acceptProxy {
-        accept_proxy = "required";
-        trusted_sources = l.trustedSources;
-      }
-    ) cfg.listeners;
+    listeners =
+      lib.mapAttrsToList (
+        name: l:
+        {
+          inherit name;
+          addr = l.address;
+          mode = modeOf name;
+        }
+        // lib.optionalAttrs l.acceptProxy {
+          accept_proxy = "required";
+          trusted_sources = l.trustedSources;
+        }
+      ) cfg.listeners
+      # Outside `listeners`: enabling it neither replaces the default listener nor receives sites.
+      ++ lib.optional cfg.httpRedirect.enable {
+        name = "http-redirect";
+        addr = cfg.httpRedirect.address;
+        mode = "http";
+      };
 
     certificates = lib.mapAttrs (_: c: { inherit (c) cert key; }) cfg.certificates;
 
@@ -150,8 +157,22 @@ in
       description = ''
         Listeners, by name. A listener is `tcp` (whole port forwarded) when a passthrough route
         without `sni` uses it, `tls` otherwise. Sites without `listeners` use every `tls` listener
-        that does not accept PROXY headers.
+        that does not accept PROXY headers. Declaring any listener replaces the default one: add
+        `default.address = ":443"` back if it is still wanted.
       '';
+    };
+
+    httpRedirect = {
+      enable = lib.mkEnableOption ''
+        a plaintext listener named `http-redirect` answering every request with a 301 to
+        `https://` on the same host and path. It is not one of `listeners`: enabling it keeps the
+        default listener, and no site or passthrough may use it
+      '';
+      address = mkOption {
+        type = types.str;
+        default = ":80";
+        description = "Go `host:port` the redirect listener binds; `:80` binds every address.";
+      };
     };
 
     certificates = mkOption {

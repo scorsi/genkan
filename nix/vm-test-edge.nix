@@ -3,7 +3,8 @@
 # port without the header. The homelab terminates TLS: its backend sees the client's address.
 # Also: an internal host is not reachable through a public SNI (G8), unknown SNI is closed on the
 # edge, an untrusted peer is closed on the PROXY listener, half-close crosses the edge, a reload
-# keeps passthrough, and both instances' logs and metrics pass nisshi and masu.
+# keeps passthrough, port 80 on the edge redirects (v1.1), and both instances' logs and metrics
+# pass nisshi and masu.
 self:
 {
   pkgs,
@@ -92,11 +93,13 @@ pkgs.testers.runNixOSTest (
     nodes.edge = {
       imports = [ self.nixosModules.default ];
       networking.firewall.allowedTCPPorts = [
+        80
         443
         2222
       ];
       services.genkan = {
         enable = true;
+        httpRedirect.enable = true;
         listeners.https.address = ":443";
         listeners.ssh.address = ":2222";
         passthrough.homelab-https = {
@@ -195,6 +198,11 @@ pkgs.testers.runNixOSTest (
       with subtest("the PROXY listener closes a peer outside trusted_sources"):
           client.fail(f"curl -sS -k --resolve app.test:8443:{HOMELAB} https://app.test:8443/")
 
+      with subtest("port 80 on the edge redirects to https, nothing forwarded (v1.1)"):
+          out = client.succeed(f"curl -sSI -H 'Host: app.test' http://{EDGE}/p?q=1")
+          assert out.startswith("HTTP/1.1 301"), out
+          assert "Location: https://app.test/p?q=1\r\n" in out, out
+
       with subtest("git SSH by port, without PROXY header, half-close carried both ways"):
           out = client.succeed(f"python3 ${sshClient} {EDGE}")
           assert out == f"ping from {EDGE}", out
@@ -210,6 +218,7 @@ pkgs.testers.runNixOSTest (
                   ['"event":"connection"', '"route":"homelab-https"', f'"client":"{CLIENT}"', '"sni":"app.test"'],
                   ['"event":"connection"', '"route":"git-ssh"', f'"client":"{CLIENT}"', '"sni":"-"'],
                   ['"event":"connection-rejected"', '"listener":"https"', '"reason":"unknown-sni"'],
+                  ['"event":"request"', '"listener":"http-redirect"', '"route":"-"', '"status":301'],
               ]),
               (homelab, [
                   ['"event":"request"', '"listener":"edge"', '"route":"app.test"', f'"client":"{CLIENT}"'],
