@@ -88,7 +88,7 @@ the homelab host, its previous server retired.
 
 ### v1.0 L4 passthrough and PROXY protocol
 
-Status: implemented; `vm-edge` and `vm` green on aarch64-linux on 2026-10-24 (5eeff2a). Remaining: deployed on the edge.
+Status: passed 2026-10-24. `vm-edge` and `vm` green on aarch64-linux (5eeff2a); deployed on the edge: one public site through the edge with PROXY v2 (client address in the homelab access log), internal hosts 404 behind the public SNI, unknown SNI closed.
 Decisions left open by the ADRs are Proposed in ADRs 0012 to 0015.
 
 Deliverable: genkan on the edge forwards public HTTPS by SNI and SSH by port to
