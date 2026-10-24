@@ -2,4 +2,7 @@ module github.com/scorsi/genkan
 
 go 1.26
 
-require github.com/pelletier/go-toml/v2 v2.4.3 // indirect
+require (
+	github.com/pelletier/go-toml/v2 v2.4.3
+	github.com/pires/go-proxyproto v0.15.0
+)
