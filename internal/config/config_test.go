@@ -47,8 +47,11 @@ func TestInvalid(t *testing.T) {
 		{"dup addr", valid + "\n[[listeners]]\nname = \"lan2\"\naddr = \"[::1]:8443\"\nmode = \"tls\"\n", `addr "[::1]:8443" already used`},
 		{"bad addr", strings.Replace(valid, `"[::1]:8443"`, `"8443"`, 1), "is not host:port"},
 		{"bad mode", strings.Replace(valid, `mode = "tls"`, `mode = "udp"`, 1), "mode must be"},
-		{"http listener", strings.Replace(valid, `mode = "tls"`, `mode = "http"`, 1), `mode "http" not implemented before v1`},
-		{"accept_proxy", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"required\"\ntrusted_sources = [\"fd42::1/128\"]", 1), "accept_proxy not implemented before v1"},
+		{"http listener", strings.Replace(valid, `mode = "tls"`, `mode = "http"`, 1), `mode "http" not implemented before v1.1`},
+		{"accept_proxy v1", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"v1\"\ntrusted_sources = [\"fd42::1/128\"]", 1), `accept_proxy must be "required"`},
+		{"accept_proxy without sources", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"required\"", 1), "accept_proxy needs a non-empty trusted_sources"},
+		{"sources without accept_proxy", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\ntrusted_sources = [\"fd42::1/128\"]", 1), "trusted_sources without accept_proxy"},
+		{"source not a CIDR", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"required\"\ntrusted_sources = [\"fd42::1\"]", 1), `trusted_sources "fd42::1" is not a CIDR`},
 		{"accept_proxy no sources", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\naccept_proxy = \"required\"", 1), "non-empty trusted_sources"},
 		{"sources without accept_proxy", strings.Replace(valid, `mode = "tls"`, "mode = \"tls\"\ntrusted_sources = [\"fd42::1/128\"]", 1), "trusted_sources without accept_proxy"},
 		{"dup route", valid + "\n[[routes]]\nname = \"forgejo\"\ntype = \"http\"\nlisteners = [\"lan\"]\nhosts = [\"b.example.org\"]\ncertificate = \"git\"\nbackend = \"http://127.0.0.1:1\"\n", `route "forgejo": duplicate name`},
@@ -65,7 +68,12 @@ func TestInvalid(t *testing.T) {
 		{"static with backend", strings.Replace(valid, `type = "http"`, "type = \"static\"\nroot = \"/var/www\"", 1), "backend is only for http and tcp routes"},
 		{"http with root", valid + "root = \"/var/www\"\n", "root is only for static routes"},
 		{"static relative root", strings.Replace(strings.Replace(valid, `type = "http"`, `type = "static"`, 1), `backend = "http://127.0.0.1:3000"`, `root = "www"`, 1), "must be an absolute path"},
-		{"tcp route", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\n", "tcp routes not implemented before v1"},
+		{"sni claimed by an http route", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"git.example.org\"]\nbackend = \"127.0.0.1:22\"\n", `"git.example.org" on listener "lan" already claimed by route "forgejo"`},
+		{"uppercase sni", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"Pass.example.org\"]\nbackend = \"127.0.0.1:22\"\n", `sni "Pass.example.org" must be lowercase`},
+		{"tcp backend not host:port", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1\"\n", `backend "127.0.0.1" is not host:port`},
+		{"send_proxy v1", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nsend_proxy = \"v1\"\n", `send_proxy must be "v2"`},
+		{"tcp route on tls and tcp listeners", valid + "\n[[listeners]]\nname = \"ssh\"\naddr = \":22\"\nmode = \"tcp\"\n\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\", \"ssh\"]\nbackend = \"127.0.0.1:22\"\n", "listeners must be all tls or all tcp"},
+		{"two routes on a tcp listener", valid + "\n[[listeners]]\nname = \"ssh\"\naddr = \":22\"\nmode = \"tcp\"\n\n[[routes]]\nname = \"a\"\ntype = \"tcp\"\nlisteners = [\"ssh\"]\nbackend = \"127.0.0.1:22\"\n\n[[routes]]\nname = \"b\"\ntype = \"tcp\"\nlisteners = [\"ssh\"]\nbackend = \"127.0.0.1:23\"\n", `listener "ssh": tcp mode needs exactly one route, has 2`},
 		{"tcp route without sni on tls", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nbackend = \"127.0.0.1:22\"\n", "sni is required on tls listeners"},
 		{"tcp listener with http route", strings.Replace(valid, `mode = "tls"`, `mode = "tcp"`, 1), `listener "lan" is tcp, only tcp routes may use it`},
 		{"tcp listener without route", valid + "\n[[listeners]]\nname = \"ssh\"\naddr = \":22\"\nmode = \"tcp\"\n", `listener "ssh": tcp mode needs exactly one route, has 0`},
@@ -143,5 +151,57 @@ func TestValidQuietPaths(t *testing.T) {
 	}
 	if errs, _ := c.Validate(); len(errs) > 0 || len(c.Routes[0].QuietPaths) != 2 {
 		t.Errorf("errs=%v quiet_paths=%q", errs, c.Routes[0].QuietPaths)
+	}
+}
+
+// The edge of ADR 0002: SNI passthrough with PROXY v2 next to a whole-port tcp listener, and the
+// homelab listener that accepts the header.
+const edge = `
+[[listeners]]
+name = "public-https"
+addr = ":443"
+mode = "tls"
+
+[[listeners]]
+name = "public-ssh"
+addr = ":2222"
+mode = "tcp"
+
+[[listeners]]
+name = "from-edge"
+addr = "[fd42::10]:8443"
+mode = "tls"
+accept_proxy = "required"
+trusted_sources = ["fd42::1/128", "192.0.2.0/24"]
+
+[[routes]]
+name = "homelab-https"
+type = "tcp"
+listeners = ["public-https"]
+sni = ["git.example.org", "cv.example.org"]
+backend = "[fd42::10]:8443"
+send_proxy = "v2"
+
+[[routes]]
+name = "git-ssh"
+type = "tcp"
+listeners = ["public-ssh"]
+backend = "[fd42::10]:2222"
+
+[[routes]]
+name = "relay"
+type = "tcp"
+listeners = ["from-edge"]
+sni = ["git.example.org"]
+backend = "127.0.0.1:8443"
+`
+
+func TestValidL4(t *testing.T) {
+	c, err := Parse(strings.NewReader(edge))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs, warns := c.Validate(); len(errs) > 0 || len(warns) > 0 {
+		t.Errorf("errs=%v warns=%v", errs, warns)
 	}
 }

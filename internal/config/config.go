@@ -139,7 +139,7 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 		switch l.Mode {
 		case "tls", "tcp":
 		case "http":
-			bad("%s: mode \"http\" not implemented before v1", where)
+			bad("%s: mode \"http\" not implemented before v1.1", where)
 		default:
 			bad("%s: mode must be tls, tcp or http, got %q", where, l.Mode)
 		}
@@ -153,7 +153,6 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if len(l.TrustedSources) == 0 {
 				bad("%s: accept_proxy needs a non-empty trusted_sources", where)
 			}
-			bad("%s: accept_proxy not implemented before v1", where)
 		} else if len(l.TrustedSources) > 0 {
 			bad("%s: trusted_sources without accept_proxy", where)
 		}
@@ -198,7 +197,7 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 		if len(r.Listeners) == 0 {
 			bad("%s: listeners must be non-empty", where)
 		}
-		allTLS := true
+		allTLS, anyTLS := true, false
 		for _, ln := range r.Listeners {
 			l, ok := listeners[ln]
 			if !ok {
@@ -206,6 +205,8 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 				continue
 			}
 			switch l.Mode {
+			case "tls":
+				anyTLS = true
 			case "http":
 				bad("%s: routes cannot reference http listener %q", where, ln)
 			case "tcp":
@@ -273,6 +274,14 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if allTLS && len(r.SNI) == 0 {
 				bad("%s: sni is required on tls listeners", where)
 			}
+			if anyTLS && !allTLS {
+				bad("%s: listeners must be all tls or all tcp", where)
+			}
+			for _, h := range r.SNI {
+				if err := checkHost(h); err != nil {
+					bad("%s: sni %q %s", where, h, err)
+				}
+			}
 			if _, _, err := net.SplitHostPort(r.Backend); err != nil {
 				bad("%s: backend %q is not host:port", where, r.Backend)
 			}
@@ -282,7 +291,6 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if len(r.Hosts) > 0 || r.Certificate != "" || r.Root != "" || len(r.QuietPaths) > 0 {
 				bad("%s: hosts, certificate, root and quiet_paths are only for http and static routes", where)
 			}
-			bad("%s: tcp routes not implemented before v1", where)
 		default:
 			bad("%s: type must be http, static or tcp, got %q", where, r.Type)
 		}
