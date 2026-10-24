@@ -33,37 +33,68 @@ let
     else
       throw "services.genkan.sites.\"${host}\": no certificate covers this host; declare one or set `certificate`";
 
+  # A listener whose passthrough route has no SNI forwards the whole port: mode tcp.
+  tcpListeners = lib.mapAttrsToList (_: p: p.listener) (
+    lib.filterAttrs (_: p: p.sni == [ ]) cfg.passthrough
+  );
+  modeOf = name: if lib.elem name tcpListeners then "tcp" else "tls";
+
+  # Where a site goes without `listeners`: TLS listeners that do not accept PROXY headers. A
+  # listener fed by the edge serves only the sites that name it (G8, ADR 0013).
+  siteListeners = lib.attrNames (
+    lib.filterAttrs (name: l: modeOf name == "tls" && !l.acceptProxy) cfg.listeners
+  );
+
   generated = {
-    listeners = lib.mapAttrsToList (name: l: {
-      inherit name;
-      addr = l.address;
-      mode = "tls";
-    }) cfg.listeners;
+    listeners = lib.mapAttrsToList (
+      name: l:
+      {
+        inherit name;
+        addr = l.address;
+        mode = modeOf name;
+      }
+      // lib.optionalAttrs l.acceptProxy {
+        accept_proxy = "required";
+        trusted_sources = l.trustedSources;
+      }
+    ) cfg.listeners;
 
     certificates = lib.mapAttrs (_: c: { inherit (c) cert key; }) cfg.certificates;
 
-    routes = lib.mapAttrsToList (
-      host: site:
-      {
-        name = host;
-        listeners = if site.listeners != null then site.listeners else lib.attrNames cfg.listeners;
-        hosts = [ host ];
-        certificate = certFor host site;
-      }
-      // lib.optionalAttrs (site.quietPaths != [ ]) { quiet_paths = site.quietPaths; }
-      // (
-        if site.root != null then
-          {
-            type = "static";
-            root = "${site.root}"; # a Nix path or package lands in the store
-          }
-        else
-          {
-            type = "http";
-            inherit (site) backend;
-          }
-      )
-    ) cfg.sites;
+    routes =
+      lib.mapAttrsToList (
+        host: site:
+        {
+          name = host;
+          listeners = if site.listeners != null then site.listeners else siteListeners;
+          hosts = [ host ];
+          certificate = certFor host site;
+        }
+        // lib.optionalAttrs (site.quietPaths != [ ]) { quiet_paths = site.quietPaths; }
+        // (
+          if site.root != null then
+            {
+              type = "static";
+              root = "${site.root}"; # a Nix path or package lands in the store
+            }
+          else
+            {
+              type = "http";
+              inherit (site) backend;
+            }
+        )
+      ) cfg.sites
+      ++ lib.mapAttrsToList (
+        name: p:
+        {
+          inherit name;
+          type = "tcp";
+          listeners = [ p.listener ];
+          inherit (p) backend;
+        }
+        // lib.optionalAttrs (p.sni != [ ]) { inherit (p) sni; }
+        // lib.optionalAttrs p.sendProxy { send_proxy = "v2"; }
+      ) cfg.passthrough;
   };
 
   # `genkan validate` at build time: an invalid config never becomes a system (ADR 0003).
@@ -90,15 +121,37 @@ in
     listeners = mkOption {
       type = types.attrsOf (
         types.submodule {
-          options.address = mkOption {
-            type = types.str;
-            example = "[fd42::10]:443";
-            description = "Go `host:port` to bind; `:443` binds every address.";
+          options = {
+            address = mkOption {
+              type = types.str;
+              example = "[fd42::10]:443";
+              description = "Go `host:port` to bind; `:443` binds every address.";
+            };
+            acceptProxy = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Require a PROXY protocol v2 header on every connection, from a peer in
+                `trustedSources`; anything else is closed before a byte is read. The header's client
+                address is what access logs and `X-Forwarded-For` show. Sites are not served here
+                unless they list this listener.
+              '';
+            };
+            trustedSources = mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              example = [ "fd42::1/128" ];
+              description = "CIDRs allowed to send PROXY headers; required with `acceptProxy`.";
+            };
           };
         }
       );
       default.default.address = ":443";
-      description = "TLS listeners, by name. Sites use all of them unless they list some.";
+      description = ''
+        Listeners, by name. A listener is `tcp` (whole port forwarded) when a passthrough route
+        without `sni` uses it, `tls` otherwise. Sites without `listeners` use every `tls` listener
+        that does not accept PROXY headers.
+      '';
     };
 
     certificates = mkOption {
@@ -170,6 +223,44 @@ in
       );
       default = { };
       description = "Sites, by hostname: an HTTP backend or a static root.";
+    };
+
+    passthrough = mkOption {
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            listener = mkOption {
+              type = types.str;
+              description = "Listener name.";
+            };
+            sni = mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              example = [ "git.example.org" ];
+              description = ''
+                Server names forwarded raw, TLS left to the backend. Empty: the whole port goes to
+                the backend, uninspected, and the listener becomes `tcp` (no site may use it).
+              '';
+            };
+            backend = mkOption {
+              type = types.str;
+              example = "[fd42::10]:8443";
+              description = "`host:port` the stream is forwarded to.";
+            };
+            sendProxy = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Prefix the backend connection with a PROXY protocol v2 header carrying the client
+                address. Only for a backend that requires it: git SSH, reached from the LAN too,
+                goes without (ADR 0002).
+              '';
+            };
+          };
+        }
+      );
+      default = { };
+      description = "Raw TCP routes (edge role), by name.";
     };
 
     metrics.listen = mkOption {
