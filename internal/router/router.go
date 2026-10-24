@@ -52,6 +52,7 @@ type Router struct {
 	access   bool
 	metrics  *metrics.Registry
 	routes   map[string]entry
+	budget   chan struct{} // in-flight requests on the listener, shared across reloads; nil: unbounded
 }
 
 type entry struct {
@@ -76,6 +77,10 @@ func (r *Router) Handle(host, route string, h http.Handler, quiet ...string) {
 	}
 	r.routes[host] = e
 }
+
+// Budget bounds the requests in flight through r with slots: one is held from routing to the end
+// of the response, and a request finding none free is answered 503 at once, without waiting.
+func (r *Router) Budget(slots chan struct{}) { r.budget = slots }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
@@ -110,10 +115,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		r.done(req, e.name, rec, start, returned && rec.status < 400 && e.quiet[req.URL.Path])
 	}()
-	if ok {
-		e.h.ServeHTTP(rec, req)
-	} else {
+	admitted := true
+	if ok && r.budget != nil {
+		select {
+		case r.budget <- struct{}{}:
+			defer func() { <-r.budget }()
+		default:
+			admitted = false
+		}
+	}
+	switch {
+	case !ok:
 		http.NotFound(rec, req)
+	case !admitted:
+		http.Error(rec, "busy", http.StatusServiceUnavailable)
+	default:
+		e.h.ServeHTTP(rec, req)
 	}
 	returned = true
 }

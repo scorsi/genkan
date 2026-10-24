@@ -286,3 +286,53 @@ func TestQuietPathAbort(t *testing.T) {
 		t.Error("aborted quiet request not logged")
 	}
 }
+
+// G9: a listener's requests in flight are bounded; one more is answered 503 at once, logged and
+// counted, and the slot comes back when the held request ends.
+func TestRequestBudget(t *testing.T) {
+	var logs bytes.Buffer
+	m := metrics.New("test")
+	r := New("edge", logging.New(&logs, slog.LevelInfo), true, m)
+	r.Budget(make(chan struct{}, 1))
+	entered, release := make(chan struct{}), make(chan struct{})
+	r.Handle("a.example", "a", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/hold" {
+			close(entered)
+			<-release
+		}
+	}))
+	front := httptest.NewServer(r)
+	defer front.Close()
+	status := func(path string) int {
+		req, _ := http.NewRequest("GET", front.URL+path, nil)
+		req.Host = "a.example"
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+
+	held := make(chan int)
+	go func() { held <- status("/hold") }()
+	<-entered
+	if got := status("/"); got != 503 {
+		t.Errorf("over budget: %d, want 503", got)
+	}
+	close(release)
+	if got := <-held; got != 200 {
+		t.Errorf("held request: %d", got)
+	}
+	if got := status("/"); got != 200 {
+		t.Errorf("after release: %d, want 200", got)
+	}
+	var out strings.Builder
+	m.Write(&out)
+	if !strings.Contains(out.String(), `genkan_requests_total{listener="edge",route="a",method="GET",code="5xx"} 1`) {
+		t.Errorf("503 not counted:\n%s", out.String())
+	}
+	if !strings.Contains(logs.String(), `"status":503`) {
+		t.Errorf("503 not logged:\n%s", logs.String())
+	}
+}
