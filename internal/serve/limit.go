@@ -49,3 +49,6 @@ func (c *limitConn) Close() error {
 	c.once.Do(func() { <-c.slots })
 	return c.Conn.Close()
 }
+
+// CloseWrite half-closes the connection for passthrough (ADR 0007), keeping the slot.
+func (c *limitConn) CloseWrite() error { return closeWrite(c.Conn) }

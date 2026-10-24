@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +35,15 @@ var (
 	ReadHeaderTimeout = 10 * time.Second
 	// IdleTimeout closes a keep-alive connection idle between requests.
 	IdleTimeout = 120 * time.Second
+)
+
+// Request budget (ADR 0014): HTTP/2 multiplexes requests over one connection, so the connection
+// cap alone does not bound the upstream connections and files a listener holds.
+const (
+	// MaxRequests is the cap on requests in flight per listener; above it genkan answers 503.
+	MaxRequests = 4096
+	// MaxStreams is the cap on concurrent HTTP/2 streams per connection (Go's default is 250).
+	MaxStreams = 100
 )
 
 // TLSConfig picks the certificate by SNI from hosts. An unknown or absent server name returns no
@@ -99,6 +109,7 @@ func newServer(h http.Handler, tlsConfig *tls.Config, errorLog *log.Logger) *htt
 		ReadHeaderTimeout: ReadHeaderTimeout,
 		IdleTimeout:       IdleTimeout,
 		ErrorLog:          errorLog,
+		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: MaxStreams},
 	}
 }
 
@@ -107,18 +118,64 @@ const handshakeError = "http: TLS handshake error"
 
 // state is what one listener serves; a reload replaces it whole.
 type state struct {
-	listener string
-	rt       *router.Router
-	hosts    map[string]*tls.Certificate
-	tls      *tls.Config // serves hosts
-	tickets  *tls.Config // key rotation is independent of reloads
+	listener   string
+	mode       string
+	trusted    []*net.IPNet // accept_proxy; nil when absent
+	access     bool
+	tcp        map[string]tcpRoute // by SNI; "" on a tcp listener
+	terminates bool                // has http or static routes: TLS ends here
+	rt         *router.Router
+	hosts      map[string]*tls.Certificate
+	tls        *tls.Config   // serves hosts
+	tickets    *tls.Config   // key rotation is independent of reloads
+	budget     chan struct{} // requests in flight; shared across reloads like tickets
 }
 
 // slot is one bound address. It survives reloads as long as some listener keeps its addr.
 type slot struct {
-	ln    net.Listener
-	srv   *http.Server
-	state atomic.Pointer[state]
+	ln      net.Listener
+	lim     *limitListener
+	handoff *handoff // what srv serves: the connections whose TLS genkan terminates
+	srv     *http.Server
+	state   atomic.Pointer[state]
+
+	mu     sync.Mutex
+	conns  map[*conn]net.Conn // passthrough client → backend
+	closed bool
+}
+
+// track registers a passthrough connection so closing the slot closes it; false once closed.
+func (sl *slot) track(c *conn, backend net.Conn) bool {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if sl.closed {
+		return false
+	}
+	if sl.conns == nil {
+		sl.conns = map[*conn]net.Conn{}
+	}
+	sl.conns[c] = backend
+	return true
+}
+
+func (sl *slot) untrack(c *conn) {
+	sl.mu.Lock()
+	delete(sl.conns, c)
+	sl.mu.Unlock()
+}
+
+// stop closes the socket, then shut ends the HTTP side, then the passthrough connections are
+// closed: no draining for them (ADR 0003).
+func (sl *slot) stop(shut func(*http.Server)) {
+	sl.lim.Close()
+	shut(sl.srv)
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	sl.closed = true
+	for c, b := range sl.conns {
+		c.Close()
+		b.Close()
+	}
 }
 
 // Server holds the bound addresses and the routing state served on each.
@@ -150,11 +207,11 @@ func (s *Server) Apply(cfg *config.Config) error {
 
 	states := map[string]*state{}
 	for _, l := range cfg.Listeners {
-		tickets := new(tls.Config)
+		tickets, budget := new(tls.Config), make(chan struct{}, MaxRequests)
 		if sl := s.slots[l.Addr]; sl != nil {
-			tickets = sl.state.Load().tickets
+			tickets, budget = sl.state.Load().tickets, sl.state.Load().budget
 		}
-		st, err := s.build(l.Name, cfg, certs, tickets)
+		st, err := s.build(l, cfg, certs, tickets, budget)
 		if err != nil {
 			return err
 		}
@@ -190,7 +247,7 @@ func (s *Server) Apply(cfg *config.Config) error {
 	}
 	for addr, sl := range s.slots {
 		if slots[addr] == nil {
-			sl.srv.Close() // no draining in v0 (ADR 0003): in-flight connections are dropped
+			sl.stop(func(srv *http.Server) { srv.Close() }) // no draining (ADR 0003): in-flight connections are dropped
 			s.log.Info("", "event", "listener-closed", "addr", addr)
 		}
 	}
@@ -201,14 +258,36 @@ func (s *Server) Apply(cfg *config.Config) error {
 	return nil
 }
 
-func (s *Server) build(listener string, cfg *config.Config, certs cert.Files, tickets *tls.Config) (*state, error) {
-	st := &state{listener: listener, rt: router.New(listener, s.log, cfg.Log.Access, s.metrics), hosts: map[string]*tls.Certificate{}, tickets: tickets}
+func (s *Server) build(l config.Listener, cfg *config.Config, certs cert.Files, tickets *tls.Config, budget chan struct{}) (*state, error) {
+	listener := l.Name
+	st := &state{
+		listener: listener, mode: l.Mode, access: cfg.Log.Access, tcp: map[string]tcpRoute{},
+		rt: router.New(listener, s.log, cfg.Log.Access, s.metrics), hosts: map[string]*tls.Certificate{},
+		tickets: tickets, budget: budget,
+	}
+	st.rt.Budget(budget)
+	for _, src := range l.TrustedSources {
+		_, n, err := net.ParseCIDR(src)
+		if err != nil {
+			return nil, fmt.Errorf("listener %q: %w", listener, err)
+		}
+		st.trusted = append(st.trusted, n)
+	}
 	for _, r := range cfg.Routes {
 		if !slices.Contains(r.Listeners, listener) {
 			continue
 		}
 		var h http.Handler
 		switch r.Type {
+		case "tcp":
+			t := tcpRoute{name: r.Name, backend: r.Backend, sendProxy: r.SendProxy == "v2"}
+			if l.Mode == "tcp" {
+				st.tcp[""] = t
+			}
+			for _, name := range r.SNI {
+				st.tcp[name] = t
+			}
+			continue
 		case "http":
 			backend, err := url.Parse(r.Backend)
 			if err != nil {
@@ -218,6 +297,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files, ti
 		case "static":
 			h = router.Static(r.Root)
 		}
+		st.terminates = true
 		for _, host := range r.Hosts {
 			st.rt.Handle(host, r.Name, h, r.QuietPaths...)
 			if certs[r.Certificate] == nil {
@@ -233,7 +313,7 @@ func (s *Server) build(listener string, cfg *config.Config, certs cert.Files, ti
 	return st, nil
 }
 
-// start serves sl with whatever state it holds at each request and each handshake.
+// start serves sl with whatever state it holds at each connection, request and handshake.
 func (s *Server) start(sl *slot) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { sl.state.Load().rt.ServeHTTP(w, r) })
 	errorLog := logging.Std(s.log, func(line string) string {
@@ -244,9 +324,25 @@ func (s *Server) start(sl *slot) {
 		return "http-error"
 	})
 	sl.srv = newServer(h, listenerTLS(sl.state.Load), errorLog)
+	sl.lim = limit(sl.ln, MaxConns)
+	sl.handoff = newHandoff(sl.ln.Addr())
 	go func() {
-		if err := sl.srv.ServeTLS(limit(sl.ln, MaxConns), "", ""); !errors.Is(err, http.ErrServerClosed) {
+		if err := sl.srv.ServeTLS(sl.handoff, "", ""); !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("", "event", "listener-stopped", "addr", sl.ln.Addr().String(), "err", err.Error())
+		}
+	}()
+	go func() {
+		for {
+			c, err := sl.lim.Accept()
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if err != nil { // such as EMFILE: retry like net/http does
+				s.log.Warn("", "event", "accept-error", "addr", sl.ln.Addr().String(), "err", err.Error())
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			go s.dispatch(sl, c)
 		}
 	}()
 }
@@ -256,7 +352,7 @@ func (s *Server) Shutdown(timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	for _, sl := range s.slots {
-		sl.srv.Shutdown(ctx)
+		sl.stop(func(srv *http.Server) { srv.Shutdown(ctx) })
 	}
 }
 
