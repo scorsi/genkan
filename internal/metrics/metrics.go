@@ -28,6 +28,14 @@ type req struct {
 	method, code string
 }
 
+// conn keys the L4 series: direction is "in" (client to backend) or "out", reason a closed set.
+type conn struct {
+	lr
+	direction string
+}
+
+type rejection struct{ listener, reason string }
+
 type hist struct {
 	counts []uint64 // per bucket, not cumulative
 	count  uint64
@@ -44,7 +52,10 @@ type Registry struct {
 	bytes     map[lr]uint64
 	upstream  map[string]uint64 // by route
 	handshake map[string]uint64 // by listener
-	expiry    map[string]int64  // by certificate, replaced on each apply
+	conns     map[lr]uint64
+	connBytes map[conn]uint64
+	rejected  map[rejection]uint64
+	expiry    map[string]int64 // by certificate, replaced on each apply
 }
 
 func New(version string) *Registry {
@@ -55,6 +66,9 @@ func New(version string) *Registry {
 		bytes:     map[lr]uint64{},
 		upstream:  map[string]uint64{},
 		handshake: map[string]uint64{},
+		conns:     map[lr]uint64{},
+		connBytes: map[conn]uint64{},
+		rejected:  map[rejection]uint64{},
 		expiry:    map[string]int64{},
 	}
 }
@@ -91,6 +105,23 @@ func (m *Registry) UpstreamError(route string) {
 func (m *Registry) HandshakeError(listener string) {
 	m.mu.Lock()
 	m.handshake[listener]++
+	m.mu.Unlock()
+}
+
+// Connection records one finished L4 passthrough connection and the bytes it copied each way.
+func (m *Registry) Connection(listener, route string, in, out int64) {
+	k := lr{listener, route}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.conns[k]++
+	m.connBytes[conn{k, "in"}] += uint64(in)
+	m.connBytes[conn{k, "out"}] += uint64(out)
+}
+
+// Rejected records a connection closed before it was routed; reason is a closed set.
+func (m *Registry) Rejected(listener, reason string) {
+	m.mu.Lock()
+	m.rejected[rejection{listener, reason}]++
 	m.mu.Unlock()
 }
 
@@ -146,7 +177,7 @@ func (m *Registry) render(w io.Writer) {
 		fmt.Fprintf(w, "genkan_response_bytes_total{%s} %d\n", k.labels(), m.bytes[k])
 	}
 
-	family(w, "genkan_upstream_errors_total", "counter", "Requests answered 502 because the backend failed before the response started.")
+	family(w, "genkan_upstream_errors_total", "counter", "Requests answered 502, or passthrough connections closed, because the backend failed before anything was forwarded.")
 	for _, r := range sorted(m.upstream, strings.Compare) {
 		fmt.Fprintf(w, "genkan_upstream_errors_total{route=%s} %d\n", q(r), m.upstream[r])
 	}
@@ -154,6 +185,23 @@ func (m *Registry) render(w io.Writer) {
 	family(w, "genkan_tls_handshake_errors_total", "counter", "Failed TLS handshakes.")
 	for _, l := range sorted(m.handshake, strings.Compare) {
 		fmt.Fprintf(w, "genkan_tls_handshake_errors_total{listener=%s} %d\n", q(l), m.handshake[l])
+	}
+
+	family(w, "genkan_connections_total", "counter", "Finished L4 passthrough connections.")
+	for _, k := range sorted(m.conns, cmpLR) {
+		fmt.Fprintf(w, "genkan_connections_total{%s} %d\n", k.labels(), m.conns[k])
+	}
+
+	family(w, "genkan_connection_bytes_total", "counter", "Bytes copied by L4 passthrough; in is client to backend.")
+	for _, k := range sorted(m.connBytes, func(a, b conn) int { return cmp.Or(cmpLR(a.lr, b.lr), strings.Compare(a.direction, b.direction)) }) {
+		fmt.Fprintf(w, "genkan_connection_bytes_total{%s,direction=%s} %d\n", k.lr.labels(), q(k.direction), m.connBytes[k])
+	}
+
+	family(w, "genkan_connections_rejected_total", "counter", "Connections closed before routing: untrusted peer, bad PROXY header, no ClientHello, unknown SNI.")
+	for _, k := range sorted(m.rejected, func(a, b rejection) int {
+		return cmp.Or(strings.Compare(a.listener, b.listener), strings.Compare(a.reason, b.reason))
+	}) {
+		fmt.Fprintf(w, "genkan_connections_rejected_total{listener=%s,reason=%s} %d\n", q(k.listener), q(k.reason), m.rejected[k])
 	}
 
 	family(w, "genkan_certificate_expiry_timestamp_seconds", "gauge", "NotAfter of each loaded certificate's leaf.")

@@ -15,6 +15,9 @@ func TestExposition(t *testing.T) {
 	m.Request("edge", "-", "GET", 404, 19, 10*time.Millisecond) // on a bound: le is inclusive
 	m.UpstreamError("forgejo")
 	m.HandshakeError("edge")
+	m.Connection("public", "homelab", 517, 4096)
+	m.Connection("public", "homelab", 3, 0)
+	m.Rejected("public", "unknown-sni")
 	m.SetCertificates(map[string]int64{"edge": 1799020800, `we"ird`: 1})
 
 	var out strings.Builder
@@ -49,12 +52,22 @@ genkan_request_duration_seconds_count{listener="edge",route="forgejo"} 3
 # TYPE genkan_response_bytes_total counter
 genkan_response_bytes_total{listener="edge",route="-"} 19
 genkan_response_bytes_total{listener="edge",route="forgejo"} 109
-# HELP genkan_upstream_errors_total Requests answered 502 because the backend failed before the response started.
+# HELP genkan_upstream_errors_total Requests answered 502, or passthrough connections closed, because the backend failed before anything was forwarded.
 # TYPE genkan_upstream_errors_total counter
 genkan_upstream_errors_total{route="forgejo"} 1
 # HELP genkan_tls_handshake_errors_total Failed TLS handshakes.
 # TYPE genkan_tls_handshake_errors_total counter
 genkan_tls_handshake_errors_total{listener="edge"} 1
+# HELP genkan_connections_total Finished L4 passthrough connections.
+# TYPE genkan_connections_total counter
+genkan_connections_total{listener="public",route="homelab"} 2
+# HELP genkan_connection_bytes_total Bytes copied by L4 passthrough; in is client to backend.
+# TYPE genkan_connection_bytes_total counter
+genkan_connection_bytes_total{listener="public",route="homelab",direction="in"} 520
+genkan_connection_bytes_total{listener="public",route="homelab",direction="out"} 4096
+# HELP genkan_connections_rejected_total Connections closed before routing: untrusted peer, bad PROXY header, no ClientHello, unknown SNI.
+# TYPE genkan_connections_rejected_total counter
+genkan_connections_rejected_total{listener="public",reason="unknown-sni"} 1
 # HELP genkan_certificate_expiry_timestamp_seconds NotAfter of each loaded certificate's leaf.
 # TYPE genkan_certificate_expiry_timestamp_seconds gauge
 genkan_certificate_expiry_timestamp_seconds{certificate="edge"} 1799020800
