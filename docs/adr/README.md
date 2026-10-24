@@ -17,3 +17,7 @@ change is a new ADR that supersedes the old one.
 | [0009](0009-certificate-not-ready.md) | A certificate pair not ready yet does not stop genkan | Accepted |
 | [0010](0010-reload-safe-session-resumption.md) | Certificate-bound session resumption across reloads | Accepted |
 | [0011](0011-quiet-paths.md) | Per-route quiet paths: successful polls are counted, not logged | Accepted |
+| [0012](0012-l4-passthrough.md) | L4 passthrough: dispatch before TLS, PROXY policy, rejections and their records | Accepted |
+| [0013](0013-proxy-listener-exposure.md) | Sites stay off PROXY listeners unless they name them (G8) | Accepted |
+| [0014](0014-request-budget.md) | Per-listener request budget and HTTP/2 stream cap (G9) | Accepted |
+| [0015](0015-reload-is-signal-delivery.md) | A successful `systemctl reload` means valid and signalled, not applied (G10) | Accepted |
