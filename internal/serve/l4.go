@@ -114,7 +114,7 @@ func (s *Server) dispatch(sl *slot, raw net.Conn) {
 	c := &conn{Conn: raw, r: raw, remote: raw.RemoteAddr(), local: raw.LocalAddr()}
 	if st.trusted != nil {
 		if reason, err := c.readProxy(st.trusted); err != nil {
-			s.reject(st, c, reason, err)
+			s.reject(st, c, reason)
 			return
 		}
 	}
@@ -126,11 +126,11 @@ func (s *Server) dispatch(sl *slot, raw net.Conn) {
 		case hello:
 			sni = name
 			if r, ok = st.tcp[name]; !ok && !st.terminates {
-				s.reject(st, c, "unknown-sni", fmt.Errorf("no tcp route for SNI %q", name))
+				s.reject(st, c, "unknown-sni")
 				return
 			}
 		case !st.terminates || errors.Is(err, os.ErrDeadlineExceeded):
-			s.reject(st, c, "client-hello", err)
+			s.reject(st, c, "client-hello")
 			return
 		}
 		// Not a ClientHello on a terminating listener: the TLS server fails it as in v0, logged as
@@ -144,10 +144,11 @@ func (s *Server) dispatch(sl *slot, raw net.Conn) {
 	s.forward(sl, st, r, c, sni, start)
 }
 
-func (s *Server) reject(st *state, c *conn, reason string, err error) {
+func (s *Server) reject(st *state, c *conn, reason string) {
 	c.Close()
 	s.metrics.Rejected(st.listener, reason)
-	s.log.Warn("", "event", "connection-rejected", "listener", st.listener, "client", c.remote.String(), "reason", reason, "err", err.Error())
+	// info and no error text: a public edge is scanned all day; reason and counter suffice (ADR 0012).
+	s.log.Info("", "event", "connection-rejected", "listener", st.listener, "client", c.remote.String(), "reason", reason)
 }
 
 // forward copies c to r's backend and back until both directions end (ADR 0007 idle and

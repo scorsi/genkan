@@ -216,7 +216,8 @@ func TestUnknownSNIOnPassthroughListener(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	eventually(t, "rejections logged and counted", func() bool {
-		return strings.Contains(logs.String(), `"event":"connection-rejected","listener":"pub","client":"127.0.0.1:`) &&
+		return strings.Contains(logs.String(), `"level":"info","v":1,"event":"connection-rejected","listener":"pub","client":"127.0.0.1:`) &&
+			!strings.Contains(logs.String(), `"reason":"unknown-sni","err"`) &&
 			strings.Contains(scrape(m), `genkan_connections_rejected_total{listener="pub",reason="unknown-sni"} 2`)
 	})
 }
