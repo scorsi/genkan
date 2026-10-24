@@ -9,8 +9,7 @@ genkan validate <file>   # exit 0 if valid, 1 with one message per problem
 genkan run <file>        # SIGHUP re-reads the same path (ADR 0003)
 ```
 
-"Since" says which milestone implements a key. `mode = "http"` (v1.1) is
-parsed and rejected by `validate` with "not implemented before v1.1".
+"Since" says which milestone implements a key.
 
 ## `[log]`
 
@@ -21,7 +20,7 @@ parsed and rejected by `validate` with "not implemented before v1.1".
 
 Logs go to stderr as nisshi log schema v1 lines (ADR 0008), from `run` and
 from `validate` alike. Access records are `"event":"request"` and carry:
-listener, route (`-` when none matched), client address (from the PROXY header
+listener, route (`-` when none matched, and on `http` listeners), client address (from the PROXY header
 on `accept_proxy` listeners, otherwise the TCP peer), method, host, path
 (no query string), proto, TLS version, status, response body bytes, `dur_us`,
 user agent. No IP anonymisation. A route's `quiet_paths` drops the records of
@@ -65,10 +64,21 @@ Modes:
   without an alert.
 - **`tcp`** (v1.0): no inspection. Exactly one `tcp` route without `sni`
   must reference this listener; every connection goes to its backend.
-- **`http`** (v1.1): plaintext HTTP. Every request is answered `301` to
-  `https://` with the same host and path. Nothing is forwarded and no routes
-  may reference it. On the edge this is how port 80 is handled; it never crosses
-  the overlay.
+- **`http`** (v1.1): plaintext HTTP/1.1. Every request, whatever its method,
+  is answered `301` with `Location: https://<host><path>?<query>`: the
+  `Host` lowercased with any port dropped (so 443), an IPv6 literal kept in
+  brackets, path and query unchanged. Nothing is forwarded and no routes may
+  reference it. A request without a usable `Host` (absent in HTTP/1.0, or only
+  a port) gets `400`; net/http itself answers an HTTP/1.1 request without
+  `Host` with `400` and `OPTIONS *` with `200`. A `POST` also gets the `301`,
+  which clients may replay as a `GET`: nothing posts to port 80. Each request
+  writes the usual `request` record (route `-`, `tls` `-`, status 301) and is
+  counted in the request metrics under route `-`; the HTTP limits of ADR 0007
+  and the request budget of ADR 0014 apply as on `tls` listeners. A reload may
+  change a listener between `http` and another mode on the same `addr`
+  without rebinding; a plaintext keep-alive connection from before such a
+  reload gets `421` and is closed. On the edge this is how port 80 is
+  handled; it never crosses the overlay.
 
 ## `[certificates.<name>]`
 
@@ -145,7 +155,8 @@ from clients work through stdlib defaults and are tested from v1.2.
   non-empty `trusted_sources`; `accept_proxy` on an `http` listener;
 - duplicate `routes[].name`; empty `listeners` list; reference to an unknown
   listener or certificate;
-- a route on an `http` listener; a `tcp` listener with zero or more than one
+- a route on an `http` listener (the message: "routes cannot reference http
+  listener"); a `tcp` listener with zero or more than one
   route, or with a route that is not `tcp`, or with a `tcp` route that has
   `sni`;
 - the same host or SNI name claimed twice on one listener, across all route
@@ -153,8 +164,7 @@ from clients work through stdlib defaults and are tested from v1.2.
   name with uppercase letters, a port or `*`;
 - `backend` not an `http://` URL (http) or not `host:port` (tcp); `root` not
   absolute; a `quiet_paths` entry not starting with `/`, containing `?` or
-  `#`, or listed twice; `quiet_paths` on a `tcp` route; a host containing `*` (before v1.2), a port, or uppercase letters;
-- an `http` listener ("not implemented before v1.1").
+  `#`, or listed twice; `quiet_paths` on a `tcp` route; a host containing `*` (before v1.2), a port, or uppercase letters.
 
 A certificate that is declared but never referenced is a warning.
 
@@ -192,3 +202,15 @@ backend = "http://127.0.0.1:3000"
 ```
 
 Full homelab and edge examples are in ADR 0002.
+
+## NixOS module notes
+
+- `services.genkan.listeners` defaults to one listener, `default` on `:443`.
+  Declaring any listener replaces that default (an attrset option's default
+  is dropped as a whole): add `listeners.default.address = ":443"` back if it
+  is still wanted.
+- `services.genkan.httpRedirect.enable` (v1.1) adds an `http` listener named
+  `http-redirect` on `httpRedirect.address` (default `:80`). It is outside
+  `listeners`, so enabling it keeps the default listener, and no site or
+  passthrough can use it (`validate` rejects a route on it at build time).
+  The firewall is left to the host.

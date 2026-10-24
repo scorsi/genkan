@@ -3,12 +3,12 @@
 A small reverse proxy for a Nix-managed homelab, in the spirit of Caddy but
 with the scope of one household: hostname routing to HTTP backends, static
 files, TLS from certificates on disk, SNI passthrough from a public edge host
-over an overlay network, and a NixOS module that generates all of its
+over an overlay network, an HTTP-to-HTTPS redirect for port 80, and a NixOS module that generates all of its
 configuration.
 
 Status: v0.1 done; v0.2 (SIGHUP reload, sd_notify, NixOS module) implemented,
 awaiting deployment; v0.3 (static routes) implemented; v1.0 (SNI passthrough,
-PROXY protocol) implemented, VM test pending on builder. Decisions live in [`docs/adr/`](docs/adr/),
+PROXY protocol) passed and deployed; v1.1 (port 80 redirect) implemented, VM test pending on builder. Decisions live in [`docs/adr/`](docs/adr/),
 the plan in [`docs/milestones.md`](docs/milestones.md), the config reference in [`docs/config.md`](docs/config.md).
 
 ## Shape
@@ -72,6 +72,7 @@ services.genkan = {
     sendProxy = true;
   };
   passthrough.git-ssh = { listener = "public-ssh"; backend = "[fd42::10]:2222"; }; # no sni: tcp listener
+  httpRedirect.enable = true; # v1.1: ":80" answers 301 to https://, same host and path
 };
 
 # Homelab: the overlay listener fed by the edge. Sites are served there only when they name it.

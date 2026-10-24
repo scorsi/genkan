@@ -117,6 +117,10 @@ the backend sees the client's address. Deployed on the edge.
 
 ### v1.1 HTTP redirect
 
+Status: implemented 2026-10-24, unit and module-unit tests green on darwin;
+`vm-edge` (now with a `:80` redirect on the edge) pending on the builder, edge
+deployment remaining.
+
 Deliverable: port 80 redirects. Public certificates come from hanko like every
 other certificate (ADR 0004); nothing to do in genkan.
 
