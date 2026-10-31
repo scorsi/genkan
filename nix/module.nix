@@ -103,7 +103,7 @@ let
         }
         // lib.optionalAttrs (p.sni != [ ]) { inherit (p) sni; }
         // lib.optionalAttrs p.sendProxy { send_proxy = "v2"; }
-        // lib.optionalAttrs (p.allow != [ ]) { inherit (p) allow; }
+        // lib.optionalAttrs (p.allow != null) { inherit (p) allow; }
       ) cfg.passthrough;
   };
 
@@ -301,8 +301,8 @@ in
               '';
             };
             allow = mkOption {
-              type = types.listOf types.str;
-              default = [ ];
+              type = types.nullOr (types.listOf types.str);
+              default = null;
               example = [
                 "fd42::/64"
                 "10.0.0.5"
@@ -311,7 +311,10 @@ in
                 Client sources allowed on this route, as CIDRs or single addresses (ADR 0017). The
                 client is the PROXY header's source on an `acceptProxy` listener, the TCP peer
                 otherwise. Any other source is closed after routing, before the backend is dialed.
-                Empty: every source.
+                `null`: no filter, the key is left out of the TOML. An empty list is passed through
+                and refused by `genkan validate`; allow every source with
+                `[ "0.0.0.0/0" "::/0" ]`. Once one route of a listener has `allow`, every
+                passthrough route of that listener needs one.
               '';
             };
           };

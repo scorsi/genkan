@@ -131,6 +131,15 @@
                 };
                 services.genkan.httpRedirect.enable = true;
               };
+              # ADR 0017: an empty allow-list reaches the TOML, so `genkan validate` refuses it.
+              emptyAllow = settings {
+                services.genkan.listeners.public-ssh.address = ":2222";
+                services.genkan.passthrough.git-ssh = {
+                  listener = "public-ssh";
+                  backend = "[fd42::10]:2222";
+                  allow = [ ];
+                };
+              };
             in
             assert lib.assertMsg (
               lib.elem "hanko.service" withHanko.after && lib.elem "hanko.service" withHanko.wants
@@ -181,6 +190,10 @@
                   "public-https"
                 ]
             ) "passthrough routes or listener modes are wrong";
+            # ADR 0017: null leaves `allow` out (no filter); an empty list is kept for validate to refuse.
+            assert lib.assertMsg (
+              !(routeOf edge "homelab-https" ? allow) && (routeOf emptyAllow "git-ssh").allow == [ ]
+            ) "passthrough allow does not reach the TOML as set";
             # ADR 0016: h2c and progress_timeout reach the TOML only when set.
             assert lib.assertMsg (
               (routeOf forge "git.home.example.org").h2c

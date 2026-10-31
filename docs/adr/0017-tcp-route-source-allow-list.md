@@ -13,9 +13,18 @@ senders).
 ## Decision
 
 **Key.** A `tcp` route gains `allow`, a list of CIDRs or single addresses (`"10.0.0.0/24"`,
-`"fd00::/64"`, `"10.0.0.5"`; an address stands for its /32 or /128). Absent or empty: no filter,
-the behaviour before this ADR. NixOS module: `passthrough.<name>.allow`, written to the TOML only
-when non-empty.
+`"fd00::/64"`, `"10.0.0.5"`; an address stands for its /32 or /128). NixOS module:
+`passthrough.<name>.allow`, default `null`, written to the TOML whenever it is not `null`.
+
+**Explicit, not implicit.** An open route is written, never inferred:
+
+- `allow = []` is a validation error: it reads as either "nobody" or "everybody". The message
+  asks for the allowed sources, or for the explicit open form.
+- Every source is `allow = ["0.0.0.0/0", "::/0"]`, plain CIDRs and no keyword. One family alone
+  is valid and means that family only.
+- Once one `tcp` route of a listener has `allow`, every `tcp` route of that listener must have
+  one; the error names the route without it. A listener with no `allow` on any route keeps the
+  behaviour before this ADR (absent: no filter), so existing configurations stay valid.
 
 **Which address.** The client address genkan already trusts for that connection: the PROXY
 header's source on an `accept_proxy` listener (whose peer was checked against `trusted_sources`
@@ -54,7 +63,12 @@ carry their own authentication. No current use case needs it; it would be its ow
 - **A new counter `genkan_connections_refused_total{listener,route}`.** The rejection family
   already exists with a closed `reason` set; one more value is the smallest change.
 - **Empty list means deny all.** A route nobody may use is a route to delete; making `[]` a
-  silent black hole is a trap, and the module's default is `[]`.
+  silent black hole is a trap.
+- **Empty list means no filter.** The first proposal of this ADR. Rejected by the owner: `[]`
+  is ambiguous, and a route that silently lets everyone in next to filtered routes on the same
+  listener is the mistake the list exists to prevent.
+- **A keyword such as `"any"` for the open form.** Rejected for plain CIDRs: no special value to
+  parse and document, and the open form says which families it covers.
 
 ## Consequences
 
@@ -66,4 +80,5 @@ carry their own authentication. No current use case needs it; it would be its ow
 
 ## Status
 
-Proposed — 2026-10-31.
+Accepted — 2026-10-31 (owner decision, including the checked address, the refusal of entries
+with bits past the prefix, and explicit open routes).

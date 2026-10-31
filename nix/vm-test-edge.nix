@@ -107,6 +107,11 @@ pkgs.testers.runNixOSTest (
           sni = [ "app.test" ];
           backend = "${homelabIP}:8443";
           sendProxy = true;
+          # ADR 0017: another route of this listener filters, so this one says it is open.
+          allow = [
+            "0.0.0.0/0"
+            "::/0"
+          ];
         };
         # ADR 0017: the client is outside this route's allow-list.
         passthrough.denied = {

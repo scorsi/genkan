@@ -170,15 +170,17 @@ trailers through the TLS listener on a route raised to 10 min.
 
 ### v1.4 Per-route source allow-list
 
-Status: implemented 2026-10-31 under ADR 0017 (proposed); unit and module-unit tests green on
-darwin, `vm-edge` pending on the builder.
+Status: implemented 2026-10-31 under ADR 0017 (accepted 2026-10-31); unit and module-unit tests
+green on darwin, `vm-edge` pending on the builder.
 
 Deliverable: a services listener carries several SNI passthrough routes, each open to its own
 clients only, without genkan decrypting anything.
 
 - `allow` on `tcp` routes: CIDRs or addresses, checked against the PROXY header's client on an
-  `accept_proxy` listener and the TCP peer otherwise, after routing and before the dial. Absent
-  or empty: no filter. NixOS module: `passthrough.<name>.allow`.
+  `accept_proxy` listener and the TCP peer otherwise, after routing and before the dial. Absent:
+  no filter, unless another `tcp` route of the listener has `allow`, which then makes it
+  required. `[]` is an error; every source is written `["0.0.0.0/0", "::/0"]`. NixOS module:
+  `passthrough.<name>.allow`, default `null`.
 - A refused source writes `connection-rejected` (listener, route, client,
   `reason = "source-not-allowed"`) and increments
   `genkan_connections_rejected_total{listener,reason}`.
@@ -186,7 +188,9 @@ clients only, without genkan decrypting anything.
 
 Acceptance: Go tests for matching (IPv4, IPv6, IPv4-mapped IPv6, single address, no list), an
 allowed and a refused connection through a `tls` listener by SNI, directly and behind PROXY
-(refused: no backend dial, event, counter), and validation errors. VM test: a refused source on
+(refused: no backend dial, event, counter), validation errors (empty list, a listener mixing
+routes with and without `allow`), the explicit open form matching every source and its IPv4-only
+form refusing IPv6. VM test: a refused source on
 the edge (`vm-edge`).
 
 ## Proposals not in scope (need agreement before entering a milestone)

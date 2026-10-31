@@ -90,6 +90,9 @@ func TestInvalid(t *testing.T) {
 		{"allow not an address", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0\"]\n", `allow "10.0.0" is not a CIDR or an IP address`},
 		{"allow host bits", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0.5/24\"]\n", `allow "10.0.0.5/24" has bits set past its prefix length`},
 		{"allow mapped", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"::ffff:10.0.0.5\"]\n", `allow "::ffff:10.0.0.5" is IPv4-mapped IPv6`},
+		{"allow empty", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = []\n", "route \"pass\": allow is empty; list the allowed sources, or write [\"0.0.0.0/0\", \"::/0\"]"},
+		{"allow empty on http", valid + "allow = []\n", "allow is only for tcp routes"},
+		{"allow missing on a filtered listener", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0.0/8\"]\n\n[[routes]]\nname = \"other\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"other.example.org\"]\nbackend = \"127.0.0.1:23\"\n", "route \"other\": allow is required, route \"pass\" on listener \"lan\" has one"},
 		{"allow zone", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"fe80::1%eth0\"]\n", `allow "fe80::1%eth0" is not a CIDR or an IP address`},
 		{"bad type", strings.Replace(valid, `type = "http"`, `type = "grpc"`, 1), "type must be"},
 		{"public metrics", valid + "\n[metrics]\nlisten = \"0.0.0.0:9100\"\n", "metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>"},
@@ -224,6 +227,17 @@ listeners = ["from-edge"]
 sni = ["git.example.org"]
 backend = "127.0.0.1:8443"
 `
+
+// The explicit open form completes a listener where another tcp route filters (ADR 0017).
+func TestValidOpenForm(t *testing.T) {
+	c, err := Parse(strings.NewReader(valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0.0/8\"]\n\n[[routes]]\nname = \"other\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"other.example.org\"]\nbackend = \"127.0.0.1:23\"\nallow = [\"0.0.0.0/0\", \"::/0\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs, warns := c.Validate(); len(errs) > 0 || len(warns) > 0 {
+		t.Errorf("errs=%v warns=%v", errs, warns)
+	}
+}
 
 func TestValidL4(t *testing.T) {
 	c, err := Parse(strings.NewReader(edge))

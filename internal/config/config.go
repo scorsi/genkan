@@ -62,7 +62,8 @@ type Route struct {
 	// H2C and ProgressTimeout are http routes' backend protocol and no-progress bound (ADR 0016).
 	H2C             bool   `toml:"h2c"`
 	ProgressTimeout string `toml:"progress_timeout"`
-	// Allow is a tcp route's source allow-list (ADR 0017); empty lets every source through.
+	// Allow is a tcp route's source allow-list (ADR 0017); nil (key absent) lets every source
+	// through, an empty list is refused.
 	Allow []string `toml:"allow"`
 }
 
@@ -181,6 +182,8 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 	used := map[string]bool{}
 	claimed := map[string]map[string]string{} // listener → host or SNI → route
 	tcpRoutes := map[string]int{}
+	allowed := map[string][]string{} // listener → tcp routes with allow
+	open := map[string][]string{}    // listener → tcp routes without allow
 	claim := func(route, listener, host string) {
 		if claimed[listener] == nil {
 			claimed[listener] = map[string]string{}
@@ -247,7 +250,7 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if r.SendProxy != "" {
 				bad("%s: send_proxy is only for tcp routes", where)
 			}
-			if len(r.Allow) > 0 {
+			if r.Allow != nil {
 				bad("%s: allow is only for tcp routes", where)
 			}
 			quiet := map[string]bool{}
@@ -299,6 +302,16 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if _, _, err := net.SplitHostPort(r.Backend); err != nil {
 				bad("%s: backend %q is not host:port", where, r.Backend)
 			}
+			if r.Allow != nil && len(r.Allow) == 0 {
+				bad("%s: allow is empty; list the allowed sources, or write [\"0.0.0.0/0\", \"::/0\"] to allow every source", where)
+			}
+			for _, ln := range r.Listeners {
+				if r.Allow != nil {
+					allowed[ln] = append(allowed[ln], r.Name)
+				} else {
+					open[ln] = append(open[ln], r.Name)
+				}
+			}
 			for _, a := range r.Allow {
 				if _, err := ParseAllow(a); err != nil {
 					bad("%s: allow %q %s", where, a, err)
@@ -325,6 +338,12 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 	for _, name := range slices.Sorted(maps(listeners)) {
 		if listeners[name].Mode == "tcp" && tcpRoutes[name] != 1 {
 			bad("listener %q: tcp mode needs exactly one route, has %d", name, tcpRoutes[name])
+		}
+		// ADR 0017: once one tcp route of a listener filters, an unfiltered one must say so.
+		if len(allowed[name]) > 0 {
+			for _, r := range open[name] {
+				bad("route %q: allow is required, route %q on listener %q has one; write [\"0.0.0.0/0\", \"::/0\"] to allow every source", r, allowed[name][0], name)
+			}
 		}
 	}
 	for _, name := range slices.Sorted(maps(c.Certificates)) {

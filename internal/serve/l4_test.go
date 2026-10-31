@@ -495,6 +495,36 @@ func TestAllows(t *testing.T) {
 	}
 }
 
+// The explicit open form lets every source through; one family alone means only that family.
+func TestAllowsOpenForm(t *testing.T) {
+	route := func(entries ...string) tcpRoute {
+		var r tcpRoute
+		for _, a := range entries {
+			p, err := config.ParseAllow(a)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.allow = append(r.allow, p)
+		}
+		return r
+	}
+	both, v4 := route("0.0.0.0/0", "::/0"), route("0.0.0.0/0")
+	for client, wantV4 := range map[string]bool{
+		"10.0.0.7:1":          true,
+		"[::ffff:10.0.0.7]:1": true,
+		"[fd00::9]:1":         false,
+		"[::1]:1":             false,
+	} {
+		addr := net.TCPAddrFromAddrPort(netip.MustParseAddrPort(client))
+		if !both.allows(addr) {
+			t.Errorf("open form refused %s", client)
+		}
+		if got := v4.allows(addr); got != wantV4 {
+			t.Errorf("IPv4-only open form: allows(%s) = %v, want %v", client, got, wantV4)
+		}
+	}
+}
+
 // ADR 0017 through a real tls listener: an allowed source reaches the backend, another one is
 // closed after SNI routing without a dial, logged with its route and counted. Behind accept_proxy
 // the header's client is checked, not the peer.
