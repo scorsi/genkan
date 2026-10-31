@@ -137,9 +137,33 @@ Deliverable: as needed by the growing homelab.
 
 - Wildcards in `hosts` (`*.example.org`), exact match wins over wildcard.
 - `path_prefix` on `http` routes, longest prefix wins, optional strip.
-- Explicit WebSocket and HTTP/2 tests.
+- Explicit WebSocket and HTTP/2 tests (done in v1.3: `internal/serve/h2c_test.go`,
+  `internal/router/upgrade_test.go`).
 
 Acceptance: unit tests for precedence rules.
+
+### v1.3 gRPC through h2c backends
+
+Status: implemented 2026-10-31 under ADR 0016 (proposed); unit and module-unit tests green on
+darwin, `vm` pending on the builder.
+
+Deliverable: the forge's gRPC (bidirectional streams included), grpc-web, git and UI behind one
+TLS route to one plaintext backend port.
+
+- `h2c` on `http` routes: HTTP/2 requests go to the backend over h2c with prior knowledge,
+  HTTP/1.1 requests (git, WebSocket) stay HTTP/1.1. NixOS module: `sites.<host>.h2c`.
+- `progress_timeout` on `http` routes replaces the 60 s no-progress bound; on an h2c stream it is
+  per stream, either direction counting as progress. NixOS module: `sites.<host>.progressTimeout`.
+- Trailers (`grpc-status`, `grpc-message`, `grpc-status-details-bin`) relayed; `te`,
+  `content-type`, `Origin` and `Host` unchanged; no request size cap.
+
+Acceptance: Go tests (standard library, gRPC framing by hand) for a bidirectional stream with
+interleaved messages, a silence past the default timeout and the three trailers; a server stream
+silent past the default timeout on a raised route and cut on a default one; a silent stream cut
+while a busy sibling on the same connections completes; a 64 MiB client stream; HTTP/1.1 and
+WebSocket on an h2c route; ALPN h2 and http/1.1; 100 concurrent streams with the 101st waiting
+(ADR 0014); no credential in access logs. VM test: a 65 s silent bidirectional stream with
+trailers through the TLS listener on a route raised to 10 min.
 
 ## Proposals not in scope (need agreement before entering a milestone)
 
@@ -149,4 +173,4 @@ Acceptance: unit tests for precedence rules.
   matters).
 - Response compression, caching, rate limiting, front auth: none requested;
   each would be its own ADR.
-- `h2c` to backends, HTTP/3: not planned.
+- HTTP/3: not planned. (`h2c` to backends: v1.3, ADR 0016.)

@@ -3,7 +3,9 @@
 # certificate rotation picked up by `systemctl reload`, a failed reload that keeps serving, and a
 # certificate absent at boot that genkan starts without and serves once it appears (ADR 0009).
 # Then (ADR 0008) every line genkan wrote passes `nisshi validate --logs`, and /metrics passes
-# `masu validate --metrics` and counts the requests.
+# `masu validate --metrics` and counts the requests. ADR 0016: a gRPC-style bidirectional stream
+# through the TLS listener to an h2c backend stays silent for 65 s on a route raised to 10 min and
+# ends with its trailers; HTTP/1.1 on that route stays HTTP/1.1.
 self:
 {
   pkgs,
@@ -25,7 +27,7 @@ let
     for leaf in first rotated; do
       openssl req -newkey rsa:2048 -nodes -subj /CN=$leaf -keyout $leaf.key -out $leaf.csr
       openssl x509 -req -in $leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 3650 \
-        -extfile <(printf 'subjectAltName=DNS:app.test,DNS:site.test') -out $leaf.pem
+        -extfile <(printf 'subjectAltName=DNS:app.test,DNS:site.test,DNS:grpc.test') -out $leaf.pem
     done
   '';
 
@@ -54,6 +56,13 @@ let
     HTTPServer(("127.0.0.1", 8080), Echo).serve_forever()
   '';
 
+  # A gRPC backend and client by hand (stdlib Go, built here; excluded from the package by its tag).
+  probe = pkgs.runCommand "h2c-probe" { nativeBuildInputs = [ pkgs.go ]; } ''
+    export HOME=$TMPDIR GOCACHE=$TMPDIR/go-cache CGO_ENABLED=0 # runCommand has no C compiler
+    cp ${./h2c-probe.go} probe.go
+    go build -o $out/bin/h2c-probe probe.go
+  '';
+
   dir = "/var/lib/hanko/test"; # where hanko writes, group genkan per certificate
   late = "/var/lib/hanko/late"; # not issued yet at boot
 in
@@ -67,6 +76,12 @@ pkgs.testers.runNixOSTest {
       wantedBy = [ "multi-user.target" ];
       before = [ "genkan.service" ];
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${backend}";
+    };
+
+    systemd.services.h2c-backend = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "genkan.service" ];
+      serviceConfig.ExecStart = "${probe}/bin/h2c-probe server 127.0.0.1:8081";
     };
 
     # The test stands in for hanko (certificate group = genkan's own group) and copies the
@@ -84,6 +99,7 @@ pkgs.testers.runNixOSTest {
         hosts = [
           "app.test"
           "site.test"
+          "grpc.test"
         ];
         cert = "${dir}/fullchain.pem";
         key = "${dir}/key.pem";
@@ -96,6 +112,11 @@ pkgs.testers.runNixOSTest {
       sites."app.test".backend = "http://127.0.0.1:8080";
       sites."late.test".backend = "http://127.0.0.1:8080";
       sites."site.test".root = site;
+      sites."grpc.test" = {
+        backend = "http://127.0.0.1:8081";
+        h2c = true;
+        progressTimeout = "10m";
+      };
       metrics.listen = metrics;
     };
 
@@ -136,6 +157,13 @@ pkgs.testers.runNixOSTest {
     with subtest("unknown SNI fails the handshake"):
         machine.fail("curl -sS -k --resolve other.test:443:127.0.0.1 https://other.test/")
 
+    with subtest("gRPC bidi stream over h2c: silent past 60 s, trailers relayed"):
+        machine.wait_for_unit("h2c-backend.service")
+        out = machine.succeed("${probe}/bin/h2c-probe client 127.0.0.1:443 grpc.test ${certs}/ca.pem 65s")
+        assert "ok alpn=h2 grpc-status=3 grpc-message=probe grpc-status-details-bin=CAMSBGRldGFpbA" in out, out
+        assert curl("grpc.test", "/proto", "--http2") == "HTTP/2.0 200"
+        assert curl("grpc.test", "/proto", "--http1.1") == "HTTP/1.1 200"
+
     pid = machine.succeed("systemctl show -P MainPID genkan").strip()
 
     with subtest("a certificate missing at boot is not ready, then served after a reload"):
@@ -174,6 +202,7 @@ pkgs.testers.runNixOSTest {
         for fields in [
             ['"event":"request"', '"route":"app.test"', '"path":"/"', '"tls":"1.3"', '"status":200'],
             ['"event":"request"', '"route":"site.test"', '"path":"/missing"', '"status":404'],
+            ['"event":"request"', '"route":"grpc.test"', '"path":"/echo.Echo/Bidi"', '"proto":"HTTP/2.0"', '"status":200'],
             ['"event":"tls-handshake-error"'],
             ['"event":"listening"', '"listener":"default"'],
         ]:

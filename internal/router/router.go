@@ -32,17 +32,42 @@ var (
 )
 
 // transport is shared by every proxy handler: the backends are few and local.
-var transport = upstreamTransport{&http.Transport{
+var transport = &http.Transport{
 	DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		c, err := (&net.Dialer{Timeout: DialTimeout}).DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return &upstreamConn{Conn: c, timeout: ProgressTimeout}, nil
+		return &upstreamConn{Conn: c}, nil
 	},
 	MaxIdleConnsPerHost: 32,
 	IdleConnTimeout:     90 * time.Second,
-}}
+}
+
+// h2cTransport speaks HTTP/2 with prior knowledge to h2c routes' backends (ADR 0016). Many streams
+// share a connection, so no deadline is set on it per request: h2cStream bounds each stream.
+var h2cTransport = func() *http.Transport {
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: DialTimeout}).DialContext(ctx, network, addr)
+		},
+		IdleConnTimeout: 90 * time.Second,
+		// Flow control keeps writes waiting on a stream, not on the socket: a socket that takes no
+		// byte for this long belongs to a frozen backend, and every stream on it is lost anyway.
+		HTTP2:     &http.HTTP2Config{WriteByteTimeout: 60 * time.Second},
+		Protocols: new(http.Protocols),
+	}
+	t.Protocols.SetUnencryptedHTTP2(true)
+	return t
+}()
+
+// Options are a proxy route's per-route settings (ADR 0016).
+type Options struct {
+	// H2C sends the requests that arrived over HTTP/2 to the backend over h2c; HTTP/1.1 stays HTTP/1.1.
+	H2C bool
+	// Timeout replaces ProgressTimeout on this route; zero keeps it.
+	Timeout time.Duration
+}
 
 // Router serves one listener: it picks the route by Host, writes one access record per request and
 // counts it.
@@ -57,9 +82,11 @@ type Router struct {
 }
 
 type entry struct {
-	name  string
-	h     http.Handler
-	quiet map[string]bool // paths not logged when they succeed (ADR 0011)
+	name    string
+	h       http.Handler
+	quiet   map[string]bool // paths not logged when they succeed (ADR 0011)
+	h2c     bool
+	timeout time.Duration // 0: ProgressTimeout
 }
 
 func New(listener string, log *slog.Logger, access bool, m *metrics.Registry) *Router {
@@ -70,6 +97,9 @@ func New(listener string, log *slog.Logger, access bool, m *metrics.Registry) *R
 // one of quiet (exact paths) that completes with a status below 400 is counted but not logged.
 func (r *Router) Handle(host, route string, h http.Handler, quiet ...string) {
 	e := entry{name: route, h: h}
+	if p, ok := h.(*proxy); ok {
+		e.h2c, e.timeout = p.opt.H2C, p.opt.Timeout
+	}
 	for _, p := range quiet {
 		if e.quiet == nil {
 			e.quiet = map[string]bool{}
@@ -91,23 +121,31 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Bound I/O, not backend processing or buffering between writes (ADR 0007).
 	rc := http.NewResponseController(w)
 	rc.SetWriteDeadline(time.Time{})
-	rec := &recorder{ResponseWriter: w, rc: rc, status: http.StatusOK}
-	// net/http must retain its original body to detect early Close and disable keep-alive.
-	req = req.WithContext(req.Context())
-	var body *progressReader
-	if req.Body != nil && req.Body != http.NoBody {
-		body = &progressReader{ReadCloser: req.Body, rc: rc}
-		req.Body = body
-		if req.ProtoMajor == 1 {
-			rec.input = body
-		}
-	}
 	e, ok := r.routes[hostOnly(req.Host)]
 	if !ok && r.fallback != nil {
 		e, ok = *r.fallback, true
 	}
 	if !ok {
 		e.name = "-" // the log schema's "no route"
+	}
+	timeout := progress(e.timeout)
+	rec := &recorder{ResponseWriter: w, rc: rc, timeout: timeout, status: http.StatusOK}
+	// net/http must retain its original body to detect early Close and disable keep-alive.
+	req = req.WithContext(req.Context())
+	var body *progressReader
+	if req.Body != nil && req.Body != http.NoBody {
+		body = &progressReader{ReadCloser: req.Body, rc: rc, timeout: timeout}
+		req.Body = body
+		if req.ProtoMajor == 1 {
+			rec.input = body
+		}
+	}
+	if e.h2c && req.ProtoMajor == 2 {
+		s := &h2cStream{timeout: timeout, body: body}
+		if body != nil {
+			body.stream = s
+		}
+		req = req.WithContext(context.WithValue(req.Context(), h2cKey{}, s))
 	}
 	// Deferred: ReverseProxy aborts a response that fails mid-body by panicking with
 	// http.ErrAbortHandler; the request is still logged and counted, then the panic goes on.
@@ -172,17 +210,31 @@ func tlsVersion(cs *tls.ConnectionState) string {
 	return strings.TrimPrefix(tls.VersionName(cs.Version), "TLS ")
 }
 
+// progress is a route's no-progress bound: its own, or ProgressTimeout read now (tests shrink it).
+func progress(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return ProgressTimeout
+}
+
+// proxy is what Proxy returns; Handle reads its options.
+type proxy struct {
+	*httputil.ReverseProxy
+	opt Options
+}
+
 // Proxy forwards to backend, keeping the client's Host and overwriting X-Forwarded-For, -Host and
 // -Proto with values genkan trusts (ReverseProxy strips the client's copies before Rewrite runs).
 // A backend that fails answers 502, logged as upstream-error and counted on route.
-func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metrics.Registry) http.Handler {
-	return &httputil.ReverseProxy{
+func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metrics.Registry, opt Options) http.Handler {
+	return &proxy{opt: opt, ReverseProxy: &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(backend)
 			pr.Out.Host = pr.In.Host
 			pr.SetXForwarded()
 		},
-		Transport: transport,
+		Transport: upstreamTransport{opt.Timeout},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			// A client that went away is not the backend's fault (httputil's default handler agrees).
 			if !errors.Is(err, context.Canceled) {
@@ -193,7 +245,7 @@ func Proxy(backend *url.URL, listener, route string, log *slog.Logger, m *metric
 		},
 		// What ReverseProxy still logs itself: a copy error once the response has started.
 		ErrorLog: logging.Std(log, func(string) string { return "proxy-error" }),
-	}
+	}}
 }
 
 // Redirect answers every request 301 to https:// on the request's host, port dropped (443), same
@@ -253,25 +305,32 @@ func hostOnly(hostport string) string {
 // to the finished request then (HTTP/2 frees it), so mu serialises rc calls with finish.
 type progressReader struct {
 	io.ReadCloser
-	rc     *http.ResponseController
-	mu     sync.Mutex
-	closed bool
-	done   bool
+	rc      *http.ResponseController
+	timeout time.Duration
+	stream  *h2cStream // set on an h2c stream: once armed, it bounds reads instead of the deadline
+	mu      sync.Mutex
+	closed  bool
+	done    bool
 }
 
-// deadline sets the read deadline unless the handler returned or, for a reset, Close took over.
+// deadline sets the read deadline unless the handler returned or, for a reset, Close took over,
+// or, for a read, an armed h2c stream bounds it.
 func (p *progressReader) deadline(d time.Time, reset bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.done && !(reset && p.closed) {
+	if !p.done && !(reset && p.closed) && !(!reset && !p.closed && p.stream.armed()) {
 		p.rc.SetReadDeadline(d)
 	}
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
-	p.deadline(time.Now().Add(ProgressTimeout), false)
+	p.deadline(time.Now().Add(p.timeout), false)
 	defer p.deadline(time.Time{}, true)
-	return p.ReadCloser.Read(b)
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.stream.touch()
+	}
+	return n, err
 }
 
 func (p *progressReader) Close() error {
@@ -282,7 +341,7 @@ func (p *progressReader) Close() error {
 	}
 	p.closed = true
 	p.mu.Unlock()
-	p.deadline(time.Now().Add(ProgressTimeout), false)
+	p.deadline(time.Now().Add(p.timeout), false)
 	defer p.deadline(time.Time{}, false)
 	return p.ReadCloser.Close()
 }
@@ -297,6 +356,7 @@ func (p *progressReader) finish() {
 type recorder struct {
 	http.ResponseWriter
 	rc          *http.ResponseController
+	timeout     time.Duration
 	input       io.Closer // HTTP/1 body to close before net/http can drain it without a deadline
 	wroteHeader bool
 	hijacked    bool
@@ -310,7 +370,7 @@ func (r *recorder) closeInput() {
 	}
 }
 
-func (r *recorder) push() { r.rc.SetWriteDeadline(time.Now().Add(ProgressTimeout)) }
+func (r *recorder) push() { r.rc.SetWriteDeadline(time.Now().Add(r.timeout)) }
 
 func (r *recorder) WriteHeader(code int) {
 	if !r.wroteHeader && (code >= 200 || code == http.StatusSwitchingProtocols) {
@@ -357,42 +417,112 @@ func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // upstreamTransport enables read deadlines only after final headers, preserving the unlimited
-// header wait and the bidirectional body ReverseProxy needs for a 101 upgrade.
-type upstreamTransport struct{ *http.Transport }
+// header wait and the bidirectional body ReverseProxy needs for a 101 upgrade. timeout is the
+// route's (0: ProgressTimeout). A request the router marked as an h2c stream goes over h2c.
+type upstreamTransport struct{ timeout time.Duration }
 
 func (t upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	body := new(atomic.Bool)
+	if s, ok := req.Context().Value(h2cKey{}).(*h2cStream); ok {
+		return s.roundTrip(req)
+	}
+	p := &pending{timeout: progress(t.timeout)}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
-			info.Conn.(*upstreamConn).body.Store(body)
+			info.Conn.(*upstreamConn).req.Store(p)
 		},
 		// A pooled connection may already belong to another request when this hook runs.
-		PutIdleConn: func(error) { body.Store(false) },
+		PutIdleConn: func(error) { p.body.Store(false) },
 	}))
-	res, err := t.Transport.RoundTrip(req)
+	res, err := transport.RoundTrip(req)
 	if err == nil && res.Body != http.NoBody && res.StatusCode != http.StatusSwitchingProtocols {
-		body.Store(true)
+		p.body.Store(true)
 	}
 	return res, err
+}
+
+// pending is the request an HTTP/1.1 upstream connection carries.
+type pending struct {
+	body    atomic.Bool // its response body is being read
+	timeout time.Duration
 }
 
 // upstreamConn measures body inactivity below HTTP buffering, on each network Read.
 type upstreamConn struct {
 	net.Conn
-	timeout time.Duration
-	body    atomic.Pointer[atomic.Bool]
+	req atomic.Pointer[pending]
 }
 
 func (c *upstreamConn) Read(b []byte) (int, error) {
-	if body := c.body.Load(); body != nil && body.Load() {
-		c.SetReadDeadline(time.Now().Add(c.timeout))
+	if p := c.req.Load(); p != nil && p.body.Load() {
+		c.SetReadDeadline(time.Now().Add(p.timeout))
 		defer c.SetReadDeadline(time.Time{})
 	}
 	return c.Conn.Read(b)
 }
 
 func (c *upstreamConn) Write(b []byte) (int, error) {
-	c.SetWriteDeadline(time.Now().Add(c.timeout))
+	timeout := ProgressTimeout
+	if p := c.req.Load(); p != nil {
+		timeout = p.timeout
+	}
+	c.SetWriteDeadline(time.Now().Add(timeout))
 	defer c.SetWriteDeadline(time.Time{})
 	return c.Conn.Write(b)
+}
+
+type h2cKey struct{}
+
+// h2cStream bounds one HTTP/2 request relayed over h2c (ADR 0016). The header wait stays unbounded
+// (ADR 0007); once the backend's headers are in, the stream is cancelled when no byte moved in
+// either direction for timeout. Cancelling resets this stream only, never its siblings.
+type h2cStream struct {
+	timeout time.Duration
+	body    *progressReader // the client's request body; nil without one
+	timer   atomic.Pointer[time.Timer]
+}
+
+func (s *h2cStream) armed() bool { return s != nil && s.timer.Load() != nil }
+
+func (s *h2cStream) touch() {
+	if s != nil {
+		if t := s.timer.Load(); t != nil {
+			t.Reset(s.timeout)
+		}
+	}
+}
+
+func (s *h2cStream) roundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancel(req.Context())
+	res, err := h2cTransport.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	s.timer.Store(time.AfterFunc(s.timeout, cancel))
+	if s.body != nil {
+		s.body.deadline(time.Time{}, true) // a read pending since before the headers
+	}
+	res.Body = &h2cBody{ReadCloser: res.Body, s: s, cancel: cancel}
+	return res, nil
+}
+
+// h2cBody is the backend's response body on an h2c stream; ReverseProxy closes it when done.
+type h2cBody struct {
+	io.ReadCloser
+	s      *h2cStream
+	cancel context.CancelFunc
+}
+
+func (b *h2cBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.s.touch()
+	}
+	return n, err
+}
+
+func (b *h2cBody) Close() error {
+	b.s.timer.Load().Stop()
+	b.cancel()
+	return b.ReadCloser.Close()
 }

@@ -37,7 +37,7 @@ func proxied(t *testing.T, h http.HandlerFunc, h2 bool) (front *httptest.Server,
 	log := logging.New(logs, nil)
 	m = metrics.New("test")
 	r := New("lan", log, true, m)
-	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m))
+	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m, Options{}))
 	front = httptest.NewUnstartedServer(r)
 	if h2 {
 		front.EnableHTTP2 = true
@@ -171,7 +171,7 @@ func TestUnreadRequestBody(t *testing.T) {
 	for name, handler := range map[string]http.Handler{
 		"static":    Static(root),
 		"unmatched": nil,
-		"proxy":     Proxy(mustURL(backend.URL), "lan", "a", log, m),
+		"proxy":     Proxy(mustURL(backend.URL), "lan", "a", log, m, Options{}),
 		"empty":     http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		"flush": http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.NewResponseController(w).Flush()
@@ -439,4 +439,41 @@ func TestH2EarlyResponseDuringUpload(t *testing.T) {
 		t.Fatalf("no 413 request line: %s", logs.String())
 	}
 	time.Sleep(100 * time.Millisecond) // lets the transport's pending body read unwind
+}
+
+// ADR 0016: a route's own timeout replaces ProgressTimeout for HTTP/1.1 backends too, per request
+// on the shared connection pool; the other route keeps the default.
+func TestRouteTimeoutHTTP1(t *testing.T) {
+	shortTimeout(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "a")
+		w.(http.Flusher).Flush()
+		time.Sleep(2 * ProgressTimeout)
+		io.WriteString(w, "b")
+	}))
+	defer backend.Close()
+	log := logging.New(io.Discard, nil)
+	m := metrics.New("test")
+	r := New("lan", log, false, m)
+	r.Handle("raised.example", "raised", Proxy(mustURL(backend.URL), "lan", "raised", log, m, Options{Timeout: 4 * ProgressTimeout}))
+	r.Handle("default.example", "default", Proxy(mustURL(backend.URL), "lan", "default", log, m, Options{}))
+	front := httptest.NewServer(r)
+	defer front.Close()
+	get := func(host string) (string, error) {
+		req, _ := http.NewRequest("GET", front.URL, nil)
+		req.Host = host
+		res, err := front.Client().Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer res.Body.Close()
+		b, err := io.ReadAll(res.Body)
+		return string(b), err
+	}
+	if body, err := get("raised.example"); body != "ab" || err != nil {
+		t.Errorf("raised route: %q, %v; want ab", body, err)
+	}
+	if body, err := get("default.example"); body == "ab" && err == nil {
+		t.Error("default route: a silent backend body was not cut")
+	}
 }

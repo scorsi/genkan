@@ -117,6 +117,8 @@ What a connection or request is forwarded to. Common keys:
 | `hosts` | list of strings | yes, non-empty | Hostnames, lowercase, no port, no wildcard in v0 (wildcards: v1.2). Matched case-insensitively against SNI and against `Host` with any port stripped. Each host may appear in only one route per listener. |
 | `certificate` | string | yes | Name of a `[certificates.<name>]` entry. |
 | `backend` | string (URL) | yes | `http://host:port` only. No path, query or userinfo. `https://` backends and Unix sockets are not supported. |
+| `h2c` | bool | no | v1.3 (ADR 0016). Default `false`. Requests that reach genkan over HTTP/2 go to `backend` over HTTP/2 cleartext with prior knowledge (no `Upgrade`); HTTP/1.1 requests, WebSocket and other upgrades included, stay HTTP/1.1. The backend must accept both on its port. Needed for gRPC: trailers and full-duplex streams are relayed. |
+| `progress_timeout` | string (Go duration) | no | v1.3 (ADR 0016). Positive, such as `"10m"`. Replaces the 60 s no-progress bound on this route's request bodies and responses. On an `h2c` HTTP/2 stream, once the backend's headers are in, the bound is per stream and a byte in either direction is progress: a heartbeat one way keeps a bidirectional stream alive, and a silent stream is cut alone, never its siblings. The wait for the backend's headers stays unbounded. Default: absent, 60 s. |
 | `quiet_paths` | list of strings | no | Exact request paths (`URL.Path`, matched case-sensitively, no query, no glob) whose `request` record is not written when the response completes with a status below 400 (ADR 0011). Failures (4xx, 5xx, `502` on upstream error, a response aborted mid-body) are still logged; metrics count every request. Each path starts with `/`, has no `?` or `#`, and appears once. Default: none. |
 
 Behaviour: requests are forwarded with `net/http/httputil.ReverseProxy`. The
@@ -125,8 +127,10 @@ that builds absolute URLs from it needs no configuration. `X-Forwarded-For`, `X-
 **overwritten**, never appended to, with the client address genkan trusts,
 `https`, and the original `Host`. Client-supplied values of these headers are
 discarded. A request whose `Host` matches no route on the listener gets
-`404`. A backend connection failure gets `502`. WebSocket upgrades and HTTP/2
-from clients work through stdlib defaults and are tested from v1.2.
+`404`. A backend connection failure gets `502`. The TLS listener offers ALPN
+`h2` then `http/1.1`. WebSocket upgrades and HTTP/2 from clients are tested
+(v1.3); trailers, `te`, `content-type` and `Origin` pass unchanged and no
+request size cap applies.
 
 ### `type = "static"` (v0.3)
 
@@ -171,7 +175,8 @@ A certificate that is declared but never referenced is a warning.
 ## Not configurable
 
 Timeouts, connection caps, header size and TLS versions are constants in
-code, chosen and justified in ADR 0007. In short: 10 s to complete the TLS
+code, chosen and justified in ADR 0007, except an `http` route's own
+`progress_timeout` (ADR 0016). In short: 10 s to complete the TLS
 handshake and request headers, 60 s without progress on a request body or a
 response, 120 s HTTP
 keep-alive idle, 5 s to dial a backend, 5 s to receive a ClientHello or PROXY
@@ -214,3 +219,7 @@ Full homelab and edge examples are in ADR 0002.
   `listeners`, so enabling it keeps the default listener, and no site or
   passthrough can use it (`validate` rejects a route on it at build time).
   The firewall is left to the host.
+- `services.genkan.sites.<host>.h2c` and `.progressTimeout` (v1.3, ADR 0016)
+  set the route's `h2c` and `progress_timeout`; they appear in the TOML only
+  when set, and only on backend sites (`validate` rejects them on a static
+  root).

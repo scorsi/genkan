@@ -298,7 +298,8 @@ func (s *Server) build(l config.Listener, cfg *config.Config, certs cert.Files, 
 			if err != nil {
 				return nil, fmt.Errorf("route %q: %w", r.Name, err)
 			}
-			h = router.Proxy(backend, listener, r.Name, s.log, s.metrics)
+			timeout, _ := time.ParseDuration(r.ProgressTimeout) // validated; "" keeps the default
+			h = router.Proxy(backend, listener, r.Name, s.log, s.metrics, router.Options{H2C: r.H2C, Timeout: timeout})
 		case "static":
 			h = router.Static(r.Root)
 		}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -57,6 +58,9 @@ type Route struct {
 	SNI         []string `toml:"sni"`
 	SendProxy   string   `toml:"send_proxy"`
 	QuietPaths  []string `toml:"quiet_paths"`
+	// H2C and ProgressTimeout are http routes' backend protocol and no-progress bound (ADR 0016).
+	H2C             bool   `toml:"h2c"`
+	ProgressTimeout string `toml:"progress_timeout"`
 }
 
 // Parse decodes TOML. Unknown keys are errors, one per key.
@@ -259,12 +263,18 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 				if r.Root != "" {
 					bad("%s: root is only for static routes", where)
 				}
+				if d, err := time.ParseDuration(r.ProgressTimeout); r.ProgressTimeout != "" && (err != nil || d <= 0) {
+					bad("%s: progress_timeout %q must be a positive Go duration such as \"10m\"", where, r.ProgressTimeout)
+				}
 			} else {
 				if !filepath.IsAbs(r.Root) {
 					bad("%s: root %q must be an absolute path", where, r.Root)
 				}
 				if r.Backend != "" {
 					bad("%s: backend is only for http and tcp routes", where)
+				}
+				if r.H2C || r.ProgressTimeout != "" {
+					bad("%s: h2c and progress_timeout are only for http routes", where)
 				}
 			}
 		case "tcp":
@@ -288,6 +298,9 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			}
 			if len(r.Hosts) > 0 || r.Certificate != "" || r.Root != "" || len(r.QuietPaths) > 0 {
 				bad("%s: hosts, certificate, root and quiet_paths are only for http and static routes", where)
+			}
+			if r.H2C || r.ProgressTimeout != "" {
+				bad("%s: h2c and progress_timeout are only for http routes", where)
 			}
 		default:
 			bad("%s: type must be http, static or tcp, got %q", where, r.Type)

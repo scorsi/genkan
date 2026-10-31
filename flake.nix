@@ -103,6 +103,12 @@
                   ];
                 }).config.services.genkan.settings;
               homelab = settings { };
+              forge = settings {
+                services.genkan.sites."git.home.example.org" = {
+                  h2c = true;
+                  progressTimeout = "10m";
+                };
+              };
               routeOf = s: name: lib.findFirst (r: r.name == name) null s.routes;
               listenerOf = s: name: lib.findFirst (l: l.name == name) null s.listeners;
               # The edge role of ADR 0002 on top of the sample.
@@ -167,6 +173,13 @@
                   "public-https"
                 ]
             ) "passthrough routes or listener modes are wrong";
+            # ADR 0016: h2c and progress_timeout reach the TOML only when set.
+            assert lib.assertMsg (
+              (routeOf forge "git.home.example.org").h2c
+              && (routeOf forge "git.home.example.org").progress_timeout == "10m"
+              && !(routeOf homelab "git.home.example.org" ? h2c)
+              && !(routeOf homelab "git.home.example.org" ? progress_timeout)
+            ) "the h2c site options are wrong";
             # v1.1: the redirect listener is http on :80, absent unless enabled, and no route uses it.
             assert lib.assertMsg (
               listenerOf edge "http-redirect" == {

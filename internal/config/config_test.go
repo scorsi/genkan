@@ -81,6 +81,10 @@ func TestInvalid(t *testing.T) {
 		{"quiet path relative", valid + "quiet_paths = [\"api/poll\"]\n", `quiet_paths "api/poll" must start with /`},
 		{"quiet path query", valid + "quiet_paths = [\"/poll?x=1\"]\n", `quiet_paths "/poll?x=1" must be a path`},
 		{"quiet path twice", valid + "quiet_paths = [\"/poll\", \"/poll\"]\n", `quiet_paths "/poll" listed twice`},
+		{"progress_timeout not a duration", valid + "progress_timeout = \"10\"\n", `progress_timeout "10" must be a positive Go duration`},
+		{"progress_timeout zero", valid + "progress_timeout = \"0s\"\n", `progress_timeout "0s" must be a positive`},
+		{"tcp h2c", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\nh2c = true\n", "h2c and progress_timeout are only for http routes"},
+		{"static progress_timeout", valid + "\n[[routes]]\nname = \"site\"\ntype = \"static\"\nlisteners = [\"lan\"]\nhosts = [\"site.example.org\"]\ncertificate = \"git\"\nroot = \"/srv\"\nprogress_timeout = \"1m\"\n", "h2c and progress_timeout are only for http routes"},
 		{"tcp quiet paths", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\nquiet_paths = [\"/\"]\n", "quiet_paths are only for http and static routes"},
 		{"bad type", strings.Replace(valid, `type = "http"`, `type = "grpc"`, 1), "type must be"},
 		{"public metrics", valid + "\n[metrics]\nlisten = \"0.0.0.0:9100\"\n", "metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>"},
@@ -152,6 +156,14 @@ func TestWarnings(t *testing.T) {
 	errs, warns := c.Validate()
 	if len(errs) > 0 || len(warns) != 1 || !strings.Contains(warns[0], "certificates.unused") {
 		t.Errorf("errs=%v warns=%v", errs, warns)
+	}
+}
+
+func TestValidH2C(t *testing.T) {
+	if c, _ := Parse(strings.NewReader(valid + "h2c = true\nprogress_timeout = \"10m\"\n")); c == nil || !c.Routes[0].H2C {
+		t.Error("h2c route not parsed")
+	} else if errs, _ := c.Validate(); len(errs) > 0 {
+		t.Errorf("h2c route: %v", errs)
 	}
 }
 

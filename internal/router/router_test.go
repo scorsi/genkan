@@ -37,8 +37,8 @@ func TestRouting(t *testing.T) {
 	log := logging.New(&logs, slog.LevelInfo)
 	m := metrics.New("test")
 	r := New("lan", log, true, m)
-	r.Handle("a.example", "route-a", Proxy(mustURL(a.URL), "lan", "route-a", log, m))
-	r.Handle("b.example", "route-b", Proxy(mustURL(b.URL), "lan", "route-b", log, m))
+	r.Handle("a.example", "route-a", Proxy(mustURL(a.URL), "lan", "route-a", log, m, Options{}))
+	r.Handle("b.example", "route-b", Proxy(mustURL(b.URL), "lan", "route-b", log, m, Options{}))
 	front := httptest.NewServer(r)
 	defer front.Close()
 
@@ -101,7 +101,7 @@ func TestBadBackend(t *testing.T) {
 	log := logging.New(&logs, slog.LevelInfo)
 	m := metrics.New("test")
 	r := New("lan", log, false, m)
-	r.Handle("a.example", "a", Proxy(mustURL("http://127.0.0.1:1"), "lan", "a", log, m))
+	r.Handle("a.example", "a", Proxy(mustURL("http://127.0.0.1:1"), "lan", "a", log, m, Options{}))
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://a.example/", nil)
 	r.ServeHTTP(rec, req)
@@ -130,7 +130,7 @@ func TestProgressDeadline(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	m := metrics.New("test")
 	r := New("lan", log, false, m)
-	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m))
+	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m, Options{}))
 	front := httptest.NewServer(r)
 	defer front.Close()
 
@@ -229,8 +229,8 @@ func TestQuietPaths(t *testing.T) {
 	log := logging.New(&logs, slog.LevelInfo)
 	m := metrics.New("test")
 	r := New("lan", log, true, m)
-	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m), "/poll")
-	r.Handle("b.example", "b", Proxy(mustURL("http://127.0.0.1:1"), "lan", "b", log, m), "/poll")
+	r.Handle("a.example", "a", Proxy(mustURL(backend.URL), "lan", "a", log, m, Options{}), "/poll")
+	r.Handle("b.example", "b", Proxy(mustURL("http://127.0.0.1:1"), "lan", "b", log, m, Options{}), "/poll")
 
 	tests := []struct {
 		host, path string

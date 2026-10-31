@@ -89,6 +89,8 @@ let
               type = "http";
               inherit (site) backend;
             }
+            // lib.optionalAttrs site.h2c { h2c = true; }
+            // lib.optionalAttrs (site.progressTimeout != null) { progress_timeout = site.progressTimeout; }
         )
       ) cfg.sites
       ++ lib.mapAttrsToList (
@@ -229,6 +231,26 @@ in
               type = types.nullOr types.str;
               default = null;
               description = "Certificate name; null picks the one whose hosts match, exact name before wildcard.";
+            };
+            h2c = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Forward the requests that reach genkan over HTTP/2 to `backend` over HTTP/2 cleartext
+                with prior knowledge (gRPC needs it); HTTP/1.1 requests, WebSocket upgrades included,
+                stay HTTP/1.1. The backend must accept both on its port (ADR 0016). Backend sites only.
+              '';
+            };
+            progressTimeout = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "10m";
+              description = ''
+                Go duration replacing the 60 s no-progress bound on this site's request bodies and
+                responses, for long-lived silent streams. On an `h2c` HTTP/2 stream it is per stream
+                and counts a byte in either direction as progress (ADR 0016). null keeps 60 s.
+                Backend sites only.
+              '';
             };
             quietPaths = mkOption {
               type = types.listOf types.str;
