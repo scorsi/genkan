@@ -460,3 +460,113 @@ func TestTCPListenerBackendHalfClose(t *testing.T) {
 		t.Error("backend never read the client's data")
 	}
 }
+
+// ADR 0017: matching on IPv4, IPv6, IPv4 seen as mapped IPv6, single addresses; no list allows all.
+func TestAllows(t *testing.T) {
+	r := tcpRoute{}
+	for _, a := range []string{"10.0.0.0/24", "fd00::/64", "192.0.2.5"} {
+		p, err := config.ParseAllow(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.allow = append(r.allow, p)
+	}
+	for client, want := range map[string]bool{
+		"10.0.0.7:1":           true,
+		"10.0.1.7:1":           false,
+		"[::ffff:10.0.0.7]:1":  true,
+		"[::ffff:10.0.1.7]:1":  false,
+		"[fd00::9]:1":          true,
+		"[fd00:0:0:1::9]:1":    false,
+		"192.0.2.5:1":          true,
+		"192.0.2.6:1":          false,
+		"[::ffff:192.0.2.5]:1": true,
+	} {
+		addr := net.TCPAddrFromAddrPort(netip.MustParseAddrPort(client))
+		if got := r.allows(addr); got != want {
+			t.Errorf("allows(%s) = %v, want %v", client, got, want)
+		}
+		if !(tcpRoute{}).allows(addr) {
+			t.Errorf("a route without allow refused %s", client)
+		}
+	}
+	if r.allows(&net.UnixAddr{Name: "x"}) {
+		t.Error("a non-TCP address passed a non-empty allow list")
+	}
+}
+
+// ADR 0017 through a real tls listener: an allowed source reaches the backend, another one is
+// closed after SNI routing without a dial, logged with its route and counted. Behind accept_proxy
+// the header's client is checked, not the peer.
+func TestAllowBySNI(t *testing.T) {
+	dials := make(chan string, 4)
+	backendCert := selfSigned(t, "backend.example")
+	pass := tcpServer(t, func(c net.Conn) {
+		dials <- c.RemoteAddr().String()
+		tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{*backendCert}})
+		io.Copy(tc, tc)
+	})
+	pub := config.Listener{Name: "pub", Addr: freeAddr(t), Mode: "tls"}
+	edge := config.Listener{Name: "edge", Addr: freeAddr(t), Mode: "tls", AcceptProxy: "required", TrustedSources: []string{"127.0.0.0/8"}}
+	_, logs, m := newTestServer(t, &config.Config{
+		Listeners: []config.Listener{pub, edge},
+		Routes: []config.Route{
+			{Name: "open", Type: "tcp", Listeners: []string{"pub"}, SNI: []string{"open.example"}, Backend: pass, Allow: []string{"127.0.0.1"}},
+			{Name: "closed", Type: "tcp", Listeners: []string{"pub", "edge"}, SNI: []string{"closed.example"}, Backend: pass, Allow: []string{"192.0.2.0/24", "fd00::/64"}},
+		},
+	})
+	noDial := func(what string) {
+		t.Helper()
+		select {
+		case d := <-dials:
+			t.Errorf("%s: backend dialed (%s)", what, d)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	from := func(src string) func(net.Conn) { return func(c net.Conn) { proxyHeader(t, c, src) } }
+
+	if err := dialVia(pub.Addr, "open.example", nil); err != nil {
+		t.Fatalf("allowed source: %v", err)
+	}
+	<-dials
+	if err := dialVia(pub.Addr, "closed.example", nil); err == nil {
+		t.Error("source outside allow reached the backend")
+	}
+	noDial("refused peer")
+	if err := dialVia(edge.Addr, "closed.example", from("192.0.2.9:4242")); err != nil {
+		t.Fatalf("allowed client behind PROXY: %v", err)
+	}
+	<-dials
+	if err := dialVia(edge.Addr, "closed.example", from("198.51.100.1:4242")); err == nil {
+		t.Error("refused client behind a trusted peer reached the backend")
+	}
+	noDial("refused PROXY client")
+	eventually(t, "refusals logged and counted", func() bool {
+		out := logs.String()
+		return strings.Contains(out, `"level":"info","v":1,"event":"connection-rejected","listener":"pub","route":"closed","client":"127.0.0.1:`) &&
+			strings.Contains(out, `"event":"connection-rejected","listener":"edge","route":"closed","client":"198.51.100.1:4242","reason":"source-not-allowed"}`) &&
+			strings.Contains(scrape(m), `genkan_connections_rejected_total{listener="pub",reason="source-not-allowed"} 1`) &&
+			strings.Contains(scrape(m), `genkan_connections_rejected_total{listener="edge",reason="source-not-allowed"} 1`)
+	})
+}
+
+// dialVia opens TLS for sni on addr, after header writes its prefix, and checks an echo.
+func dialVia(addr, sni string, header func(net.Conn)) error {
+	raw, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	if header != nil {
+		header(raw)
+	}
+	c := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: true})
+	raw.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := c.Handshake(); err != nil {
+		return err
+	}
+	io.WriteString(c, "ping")
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(c, buf)
+	return err
+}

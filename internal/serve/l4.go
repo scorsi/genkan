@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -32,6 +33,22 @@ var (
 type tcpRoute struct {
 	name, backend string
 	sendProxy     bool
+	allow         []netip.Prefix // empty: every source (ADR 0017)
+}
+
+// allows reports whether client, the PROXY header's source on an accept_proxy listener and the
+// TCP peer otherwise, may use the route.
+func (r tcpRoute) allows(client net.Addr) bool {
+	if len(r.allow) == 0 {
+		return true
+	}
+	t, ok := client.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	ip, ok := netip.AddrFromSlice(t.IP)
+	ip = ip.Unmap() // a dual-stack socket reports IPv4 clients as ::ffff:a.b.c.d
+	return ok && slices.ContainsFunc(r.allow, func(p netip.Prefix) bool { return p.Contains(ip) })
 }
 
 // conn is an accepted connection whose first bytes genkan has read: Read replays them first, and
@@ -144,6 +161,12 @@ func (s *Server) dispatch(sl *slot, raw net.Conn) {
 		return
 	case !ok:
 		sl.handoff.push(c)
+		return
+	case !r.allows(c.remote):
+		// Closed before any dial (ADR 0017); same record as ADR 0012's rejections, plus the route.
+		c.Close()
+		s.metrics.Rejected(st.listener, "source-not-allowed")
+		s.log.Info("", "event", "connection-rejected", "listener", st.listener, "route", r.name, "client", c.remote.String(), "reason", "source-not-allowed")
 		return
 	}
 	s.forward(sl, st, r, c, sni, start)

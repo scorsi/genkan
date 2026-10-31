@@ -69,7 +69,7 @@ genkan_connections_total{listener="public",route="homelab"} 2
 # TYPE genkan_connection_bytes_total counter
 genkan_connection_bytes_total{listener="public",route="homelab",direction="in"} 520
 genkan_connection_bytes_total{listener="public",route="homelab",direction="out"} 4096
-# HELP genkan_connections_rejected_total Connections closed before routing: untrusted peer, bad PROXY header, no ClientHello, unknown SNI.
+# HELP genkan_connections_rejected_total Connections closed before reaching a backend: untrusted peer, bad PROXY header, no ClientHello, unknown SNI, source not allowed.
 # TYPE genkan_connections_rejected_total counter
 genkan_connections_rejected_total{listener="public",reason="unknown-sni"} 1
 # HELP genkan_certificate_expiry_timestamp_seconds NotAfter of each loaded certificate's leaf.

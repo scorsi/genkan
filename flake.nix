@@ -124,6 +124,10 @@
                 services.genkan.passthrough.git-ssh = {
                   listener = "public-ssh";
                   backend = "[fd42::10]:2222";
+                  allow = [
+                    "fd42::/64"
+                    "192.0.2.7"
+                  ];
                 };
                 services.genkan.httpRedirect.enable = true;
               };
@@ -166,6 +170,10 @@
                   type = "tcp";
                   listeners = [ "public-ssh" ];
                   backend = "[fd42::10]:2222";
+                  allow = [
+                    "fd42::/64"
+                    "192.0.2.7"
+                  ];
                 }
               &&
                 (routeOf edge "site.home.example.org").listeners == [

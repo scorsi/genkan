@@ -286,6 +286,13 @@ func (s *Server) build(l config.Listener, cfg *config.Config, certs cert.Files, 
 		switch r.Type {
 		case "tcp":
 			t := tcpRoute{name: r.Name, backend: r.Backend, sendProxy: r.SendProxy == "v2"}
+			for _, a := range r.Allow {
+				p, err := config.ParseAllow(a)
+				if err != nil {
+					return nil, fmt.Errorf("route %q: allow %q: %w", r.Name, a, err)
+				}
+				t.allow = append(t.allow, p)
+			}
 			if l.Mode == "tcp" {
 				st.tcp[""] = t
 			}

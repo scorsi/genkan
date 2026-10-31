@@ -168,6 +168,27 @@ WebSocket on an h2c route; ALPN h2 and http/1.1; 100 concurrent streams with the
 stream cut and an HTTP/1.1 backend cut. VM test: a 65 s silent bidirectional stream with
 trailers through the TLS listener on a route raised to 10 min.
 
+### v1.4 Per-route source allow-list
+
+Status: implemented 2026-10-31 under ADR 0017 (proposed); unit and module-unit tests green on
+darwin, `vm-edge` pending on the builder.
+
+Deliverable: a services listener carries several SNI passthrough routes, each open to its own
+clients only, without genkan decrypting anything.
+
+- `allow` on `tcp` routes: CIDRs or addresses, checked against the PROXY header's client on an
+  `accept_proxy` listener and the TCP peer otherwise, after routing and before the dial. Absent
+  or empty: no filter. NixOS module: `passthrough.<name>.allow`.
+- A refused source writes `connection-rejected` (listener, route, client,
+  `reason = "source-not-allowed"`) and increments
+  `genkan_connections_rejected_total{listener,reason}`.
+- Not on `http` and `static` routes (ADR 0017).
+
+Acceptance: Go tests for matching (IPv4, IPv6, IPv4-mapped IPv6, single address, no list), an
+allowed and a refused connection through a `tls` listener by SNI, directly and behind PROXY
+(refused: no backend dial, event, counter), and validation errors. VM test: a refused source on
+the edge (`vm-edge`).
+
 ## Proposals not in scope (need agreement before entering a milestone)
 
 - Admin listener with `/healthz` (v1+). `/metrics` on loopback is decided by

@@ -103,6 +103,7 @@ let
         }
         // lib.optionalAttrs (p.sni != [ ]) { inherit (p) sni; }
         // lib.optionalAttrs p.sendProxy { send_proxy = "v2"; }
+        // lib.optionalAttrs (p.allow != [ ]) { inherit (p) allow; }
       ) cfg.passthrough;
   };
 
@@ -297,6 +298,20 @@ in
                 Prefix the backend connection with a PROXY protocol v2 header carrying the client
                 address. Only for a backend that requires it: git SSH, reached from the LAN too,
                 goes without (ADR 0002).
+              '';
+            };
+            allow = mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              example = [
+                "fd42::/64"
+                "10.0.0.5"
+              ];
+              description = ''
+                Client sources allowed on this route, as CIDRs or single addresses (ADR 0017). The
+                client is the PROXY header's source on an `acceptProxy` listener, the TCP peer
+                otherwise. Any other source is closed after routing, before the backend is dialed.
+                Empty: every source.
               '';
             };
           };

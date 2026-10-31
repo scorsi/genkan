@@ -32,7 +32,9 @@ connection ends: listener, route, client address (from the PROXY header on
 to backend), `bytes_out`, `dur_us`; also subject to `access`. A connection
 closed before routing writes an info `"event":"connection-rejected"` with
 listener, client and `reason` (`untrusted-peer`, `proxy-header`, `client-hello`,
-`unknown-sni`), counted in `genkan_connections_rejected_total`. A failed backend dial is an `upstream-error`.
+`unknown-sni`), counted in `genkan_connections_rejected_total`. A source outside
+a `tcp` route's `allow` is the same event with the `route` added and
+`reason` `source-not-allowed` (ADR 0017). A failed backend dial is an `upstream-error`.
 
 A request or h2c stream cut by its route's no-progress bound (60 s or
 `progress_timeout`) writes an info `"event":"progress-timeout"` with listener,
@@ -154,6 +156,7 @@ request size cap applies.
 | `sni` | list of strings | depends on listener mode | Server names, lowercase, exact. Required and non-empty when every referenced listener is `tls`; forbidden when any is `tcp`. A name may appear in only one route per listener, and never also in an `http`/`static` route's `hosts` on the same listener. |
 | `backend` | string | yes | `host:port`. The raw stream is copied both ways; a half-close is passed on and the other direction goes on until it ends too, or until both directions are idle for 1 h. Established connections keep their backend across reloads; a removed listener closes them. |
 | `send_proxy` | string | no | Only `"v2"`. Prefix the backend connection with a PROXY protocol v2 header carrying the client address genkan trusts. Forbidden on `http` and `static` routes. |
+| `allow` | list of strings | no | v1.4 (ADR 0017). Client sources allowed on the route: CIDRs (`"10.0.0.0/24"`, `"fd00::/64"`) or single addresses (`"10.0.0.5"`). The client is the PROXY header's source on an `accept_proxy` listener, the TCP peer otherwise; IPv4-mapped IPv6 clients match as IPv4. Any other source is closed after routing, before the backend is dialed. Absent or empty: every source. Forbidden on `http` and `static` routes. |
 
 ## Validation rules
 
@@ -174,7 +177,9 @@ request size cap applies.
   name with uppercase letters, a port or `*`;
 - `backend` not an `http://` URL (http) or not `host:port` (tcp); `root` not
   absolute; a `quiet_paths` entry not starting with `/`, containing `?` or
-  `#`, or listed twice; `quiet_paths` on a `tcp` route; a host containing `*` (before v1.2), a port, or uppercase letters.
+  `#`, or listed twice; `quiet_paths` on a `tcp` route; `allow` on an `http`
+  or `static` route, or an `allow` entry that is not a CIDR or address, is
+  IPv4-mapped IPv6, carries a zone or sets bits past its prefix length; a host containing `*` (before v1.2), a port, or uppercase letters.
 
 A certificate that is declared but never referenced is a warning.
 
@@ -225,6 +230,8 @@ Full homelab and edge examples are in ADR 0002.
   `listeners`, so enabling it keeps the default listener, and no site or
   passthrough can use it (`validate` rejects a route on it at build time).
   The firewall is left to the host.
+- `services.genkan.passthrough.<name>.allow` (v1.4, ADR 0017) sets the
+  route's `allow`; it appears in the TOML only when non-empty.
 - `services.genkan.sites.<host>.h2c` and `.progressTimeout` (v1.3, ADR 0016)
   set the route's `h2c` and `progress_timeout`; they appear in the TOML only
   when set, and only on backend sites (`validate` rejects them on a static

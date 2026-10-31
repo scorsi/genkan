@@ -108,6 +108,13 @@ pkgs.testers.runNixOSTest (
           backend = "${homelabIP}:8443";
           sendProxy = true;
         };
+        # ADR 0017: the client is outside this route's allow-list.
+        passthrough.denied = {
+          listener = "https";
+          sni = [ "denied.test" ];
+          backend = "${homelabIP}:8443";
+          allow = [ "192.0.2.0/24" ];
+        };
         passthrough.git-ssh = {
           listener = "ssh";
           backend = "${homelabIP}:2222";
@@ -195,6 +202,9 @@ pkgs.testers.runNixOSTest (
       with subtest("unknown SNI on the edge is closed"):
           client.fail(f"curl -sS -k --resolve internal.test:443:{EDGE} https://internal.test/")
 
+      with subtest("a source outside a route's allow-list is closed (ADR 0017)"):
+          client.fail(f"curl -sS -k --resolve denied.test:443:{EDGE} https://denied.test/")
+
       with subtest("the PROXY listener closes a peer outside trusted_sources"):
           client.fail(f"curl -sS -k --resolve app.test:8443:{HOMELAB} https://app.test:8443/")
 
@@ -218,6 +228,7 @@ pkgs.testers.runNixOSTest (
                   ['"event":"connection"', '"route":"homelab-https"', f'"client":"{CLIENT}"', '"sni":"app.test"'],
                   ['"event":"connection"', '"route":"git-ssh"', f'"client":"{CLIENT}"', '"sni":"-"'],
                   ['"event":"connection-rejected"', '"listener":"https"', '"reason":"unknown-sni"'],
+                  ['"event":"connection-rejected"', '"route":"denied"', f'"client":"{CLIENT}:', '"reason":"source-not-allowed"'],
                   ['"event":"request"', '"listener":"http-redirect"', '"route":"-"', '"status":301'],
               ]),
               (homelab, [
@@ -236,6 +247,8 @@ pkgs.testers.runNixOSTest (
           assert 'genkan_connections_total{listener="https",route="homelab-https"} ' in out, out
           assert 'genkan_connections_total{listener="ssh",route="git-ssh"} 1' in out, out
           assert 'genkan_connections_rejected_total{listener="https",reason="unknown-sni"} 1' in out, out
+          assert 'genkan_connections_rejected_total{listener="https",reason="source-not-allowed"} 1' in out, out
+          assert 'route="denied"' not in out, out  # never dialed, never counted as a connection
           out = homelab.succeed("curl -sS http://${metrics}/metrics")
           assert 'genkan_connections_rejected_total{listener="edge",reason="untrusted-peer"} 1' in out, out
     '';

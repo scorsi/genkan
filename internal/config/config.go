@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -61,6 +62,8 @@ type Route struct {
 	// H2C and ProgressTimeout are http routes' backend protocol and no-progress bound (ADR 0016).
 	H2C             bool   `toml:"h2c"`
 	ProgressTimeout string `toml:"progress_timeout"`
+	// Allow is a tcp route's source allow-list (ADR 0017); empty lets every source through.
+	Allow []string `toml:"allow"`
 }
 
 // Parse decodes TOML. Unknown keys are errors, one per key.
@@ -244,6 +247,9 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			if r.SendProxy != "" {
 				bad("%s: send_proxy is only for tcp routes", where)
 			}
+			if len(r.Allow) > 0 {
+				bad("%s: allow is only for tcp routes", where)
+			}
 			quiet := map[string]bool{}
 			for _, p := range r.QuietPaths {
 				switch {
@@ -292,6 +298,11 @@ func (c *Config) Validate() (errs []error, warnings []string) {
 			}
 			if _, _, err := net.SplitHostPort(r.Backend); err != nil {
 				bad("%s: backend %q is not host:port", where, r.Backend)
+			}
+			for _, a := range r.Allow {
+				if _, err := ParseAllow(a); err != nil {
+					bad("%s: allow %q %s", where, a, err)
+				}
 			}
 			if r.SendProxy != "" && r.SendProxy != "v2" {
 				bad("%s: send_proxy must be \"v2\", got %q", where, r.SendProxy)
@@ -346,6 +357,26 @@ func checkHost(h string) error {
 		return errors.New("must be lowercase")
 	}
 	return nil
+}
+
+// ParseAllow reads one `allow` entry: a CIDR, or an address standing for its own /32 or /128.
+func ParseAllow(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		a, aerr := netip.ParseAddr(s)
+		if aerr != nil || a.Zone() != "" {
+			return netip.Prefix{}, errors.New("is not a CIDR or an IP address")
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	switch {
+	case p.Addr().Is4In6():
+		// Clients are matched unmapped: a mapped entry would never match.
+		return netip.Prefix{}, errors.New("is IPv4-mapped IPv6, write the IPv4 form")
+	case p != p.Masked():
+		return netip.Prefix{}, errors.New("has bits set past its prefix length")
+	}
+	return p, nil
 }
 
 func checkBackendURL(s string) error {

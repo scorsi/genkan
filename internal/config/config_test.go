@@ -86,6 +86,11 @@ func TestInvalid(t *testing.T) {
 		{"tcp h2c", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\nh2c = true\n", "h2c and progress_timeout are only for http routes"},
 		{"static progress_timeout", valid + "\n[[routes]]\nname = \"site\"\ntype = \"static\"\nlisteners = [\"lan\"]\nhosts = [\"site.example.org\"]\ncertificate = \"git\"\nroot = \"/srv\"\nprogress_timeout = \"1m\"\n", "h2c and progress_timeout are only for http routes"},
 		{"tcp quiet paths", valid + "\n[[routes]]\nname = \"ssh\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"ssh.example.org\"]\nbackend = \"127.0.0.1:22\"\nquiet_paths = [\"/\"]\n", "quiet_paths are only for http and static routes"},
+		{"allow on http", valid + "allow = [\"10.0.0.0/8\"]\n", "allow is only for tcp routes"},
+		{"allow not an address", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0\"]\n", `allow "10.0.0" is not a CIDR or an IP address`},
+		{"allow host bits", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"10.0.0.5/24\"]\n", `allow "10.0.0.5/24" has bits set past its prefix length`},
+		{"allow mapped", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"::ffff:10.0.0.5\"]\n", `allow "::ffff:10.0.0.5" is IPv4-mapped IPv6`},
+		{"allow zone", valid + "\n[[routes]]\nname = \"pass\"\ntype = \"tcp\"\nlisteners = [\"lan\"]\nsni = [\"pass.example.org\"]\nbackend = \"127.0.0.1:22\"\nallow = [\"fe80::1%eth0\"]\n", `allow "fe80::1%eth0" is not a CIDR or an IP address`},
 		{"bad type", strings.Replace(valid, `type = "http"`, `type = "grpc"`, 1), "type must be"},
 		{"public metrics", valid + "\n[metrics]\nlisten = \"0.0.0.0:9100\"\n", "metrics.listen: must be 127.0.0.1:<port> or [::1]:<port>"},
 		{"metrics without port", valid + "\n[metrics]\nlisten = \"127.0.0.1\"\n", "metrics.listen"},
@@ -210,6 +215,7 @@ name = "git-ssh"
 type = "tcp"
 listeners = ["public-ssh"]
 backend = "[fd42::10]:2222"
+allow = ["fd42::/64", "192.0.2.7"]
 
 [[routes]]
 name = "relay"
@@ -226,5 +232,20 @@ func TestValidL4(t *testing.T) {
 	}
 	if errs, warns := c.Validate(); len(errs) > 0 || len(warns) > 0 {
 		t.Errorf("errs=%v warns=%v", errs, warns)
+	}
+}
+
+// An address stands for its own /32 or /128; prefixes are kept as written.
+func TestParseAllow(t *testing.T) {
+	for in, want := range map[string]string{
+		"10.0.0.0/24": "10.0.0.0/24",
+		"10.0.0.5":    "10.0.0.5/32",
+		"fd00::/64":   "fd00::/64",
+		"fd00::5":     "fd00::5/128",
+		"0.0.0.0/0":   "0.0.0.0/0",
+	} {
+		if p, err := ParseAllow(in); err != nil || p.String() != want {
+			t.Errorf("ParseAllow(%q) = %v, %v; want %s", in, p, err, want)
+		}
 	}
 }

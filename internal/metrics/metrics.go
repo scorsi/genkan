@@ -211,7 +211,7 @@ func (m *Registry) render(w io.Writer) {
 		fmt.Fprintf(w, "genkan_connection_bytes_total{%s,direction=%s} %d\n", k.lr.labels(), q(k.direction), m.connBytes[k])
 	}
 
-	family(w, "genkan_connections_rejected_total", "counter", "Connections closed before routing: untrusted peer, bad PROXY header, no ClientHello, unknown SNI.")
+	family(w, "genkan_connections_rejected_total", "counter", "Connections closed before reaching a backend: untrusted peer, bad PROXY header, no ClientHello, unknown SNI, source not allowed.")
 	for _, k := range sorted(m.rejected, func(a, b rejection) int {
 		return cmp.Or(strings.Compare(a.listener, b.listener), strings.Compare(a.reason, b.reason))
 	}) {
