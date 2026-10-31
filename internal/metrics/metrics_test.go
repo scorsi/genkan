@@ -14,6 +14,7 @@ func TestExposition(t *testing.T) {
 	m.Request("edge", "forgejo", "BREW", 404, 9, time.Millisecond)
 	m.Request("edge", "-", "GET", 404, 19, 10*time.Millisecond) // on a bound: le is inclusive
 	m.UpstreamError("forgejo")
+	m.ProgressTimeout("forgejo")
 	m.HandshakeError("edge")
 	m.Connection("public", "homelab", 517, 4096)
 	m.Connection("public", "homelab", 3, 0)
@@ -55,6 +56,9 @@ genkan_response_bytes_total{listener="edge",route="forgejo"} 109
 # HELP genkan_upstream_errors_total Requests answered 502, or passthrough connections closed, because the backend failed before anything was forwarded.
 # TYPE genkan_upstream_errors_total counter
 genkan_upstream_errors_total{route="forgejo"} 1
+# HELP genkan_progress_timeouts_total Requests and h2c streams cut because nothing moved for the route's progress timeout.
+# TYPE genkan_progress_timeouts_total counter
+genkan_progress_timeouts_total{route="forgejo"} 1
 # HELP genkan_tls_handshake_errors_total Failed TLS handshakes.
 # TYPE genkan_tls_handshake_errors_total counter
 genkan_tls_handshake_errors_total{listener="edge"} 1

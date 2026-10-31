@@ -27,6 +27,8 @@ milestones listed an admin `/metrics` listener as a v1+ proposal.
   `dur_us`, and `user_agent` (milestone v0.1). Written when `log.access` is true.
 - `upstream-error` (warn): the backend failed before the response started; `listener`,
   `route`, `err`. A client that went away is not one.
+- `progress-timeout` (info): a request or h2c stream cut by its route's no-progress bound;
+  `listener`, `route`, `phase` (added by ADR 0016, 2026-10-31).
 - net/http's and httputil's own error lines go through a `*log.Logger` adapter into slog as
   warn lines with the line as `err`: `tls-handshake-error` for net/http's
   `http: TLS handshake error` lines (the only hook it offers), `http-error` for the rest of
@@ -49,6 +51,7 @@ Hand-written Prometheus text 0.0.4 (`internal/metrics`), no client library (ADR 
 | `genkan_request_duration_seconds` (histogram, buckets 0.01, 0.05, 0.25, 1, 5 s) | `listener`, `route` |
 | `genkan_response_bytes_total` | `listener`, `route` |
 | `genkan_upstream_errors_total` | `route` |
+| `genkan_progress_timeouts_total` (ADR 0016) | `route` |
 | `genkan_tls_handshake_errors_total` | `listener` |
 | `genkan_certificate_expiry_timestamp_seconds` (gauge, leaf NotAfter) | `certificate` |
 

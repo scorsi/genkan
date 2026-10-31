@@ -34,6 +34,12 @@ closed before routing writes an info `"event":"connection-rejected"` with
 listener, client and `reason` (`untrusted-peer`, `proxy-header`, `client-hello`,
 `unknown-sni`), counted in `genkan_connections_rejected_total`. A failed backend dial is an `upstream-error`.
 
+A request or h2c stream cut by its route's no-progress bound (60 s or
+`progress_timeout`) writes an info `"event":"progress-timeout"` with listener,
+route and `phase` (`client-read`, `client-write`, `backend-read`,
+`backend-write`, `stream`), counted in `genkan_progress_timeouts_total{route}`
+(ADR 0016).
+
 ## `[metrics]`
 
 | Key | Type | Required | Default | Since | Notes |

@@ -51,6 +51,7 @@ type Registry struct {
 	durations map[lr]*hist
 	bytes     map[lr]uint64
 	upstream  map[string]uint64 // by route
+	progress  map[string]uint64 // by route
 	handshake map[string]uint64 // by listener
 	conns     map[lr]uint64
 	connBytes map[conn]uint64
@@ -65,6 +66,7 @@ func New(version string) *Registry {
 		durations: map[lr]*hist{},
 		bytes:     map[lr]uint64{},
 		upstream:  map[string]uint64{},
+		progress:  map[string]uint64{},
 		handshake: map[string]uint64{},
 		conns:     map[lr]uint64{},
 		connBytes: map[conn]uint64{},
@@ -99,6 +101,13 @@ func (m *Registry) Request(listener, route, method string, status int, bytes int
 func (m *Registry) UpstreamError(route string) {
 	m.mu.Lock()
 	m.upstream[route]++
+	m.mu.Unlock()
+}
+
+// ProgressTimeout records a request or h2c stream cut by its route's no-progress bound (ADR 0016).
+func (m *Registry) ProgressTimeout(route string) {
+	m.mu.Lock()
+	m.progress[route]++
 	m.mu.Unlock()
 }
 
@@ -180,6 +189,11 @@ func (m *Registry) render(w io.Writer) {
 	family(w, "genkan_upstream_errors_total", "counter", "Requests answered 502, or passthrough connections closed, because the backend failed before anything was forwarded.")
 	for _, r := range sorted(m.upstream, strings.Compare) {
 		fmt.Fprintf(w, "genkan_upstream_errors_total{route=%s} %d\n", q(r), m.upstream[r])
+	}
+
+	family(w, "genkan_progress_timeouts_total", "counter", "Requests and h2c streams cut because nothing moved for the route's progress timeout.")
+	for _, r := range sorted(m.progress, strings.Compare) {
+		fmt.Fprintf(w, "genkan_progress_timeouts_total{route=%s} %d\n", q(r), m.progress[r])
 	}
 
 	family(w, "genkan_tls_handshake_errors_total", "counter", "Failed TLS handshakes.")

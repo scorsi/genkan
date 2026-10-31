@@ -21,4 +21,4 @@ change is a new ADR that supersedes the old one.
 | [0013](0013-proxy-listener-exposure.md) | Sites stay off PROXY listeners unless they name them (G8) | Accepted |
 | [0014](0014-request-budget.md) | Per-listener request budget and HTTP/2 stream cap (G9) | Accepted |
 | [0015](0015-reload-is-signal-delivery.md) | A successful `systemctl reload` means valid and signalled, not applied (G10) | Accepted |
-| [0016](0016-h2c-backends.md) | HTTP/2 cleartext (h2c) to backends, per-route; per-stream progress bound | Proposed |
+| [0016](0016-h2c-backends.md) | HTTP/2 cleartext (h2c) to backends, per-route; per-stream progress bound | Accepted |

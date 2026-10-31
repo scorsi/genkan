@@ -307,7 +307,7 @@ func TestStalledUpstreamBody(t *testing.T) {
 	shortTimeout(t)
 	done := make(chan struct{}) // closed before the servers, so blocked handlers return
 	defer close(done)
-	front, _, _ := proxied(t, func(w http.ResponseWriter, r *http.Request) {
+	front, logs, m := proxied(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write(make([]byte, 8192))
 		w.(http.Flusher).Flush()
 		select {
@@ -331,6 +331,14 @@ func TestStalledUpstreamBody(t *testing.T) {
 	_, err = io.ReadAll(res.Body)
 	if ne, ok := err.(net.Error); err == nil || ok && ne.Timeout() {
 		t.Errorf("stalled backend body: %v, want the response aborted by genkan", err)
+	}
+	if !waitFor(logs, `"event":"progress-timeout","listener":"lan","route":"a","phase":"backend-read"`) {
+		t.Errorf("no progress-timeout line: %s", logs.String())
+	}
+	var out strings.Builder
+	m.Write(&out)
+	if !strings.Contains(out.String(), `genkan_progress_timeouts_total{route="a"} 1`+"\n") {
+		t.Errorf("cut not counted:\n%s", out.String())
 	}
 }
 

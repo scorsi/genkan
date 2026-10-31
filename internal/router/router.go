@@ -13,6 +13,7 @@ import (
 	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -30,6 +31,10 @@ var (
 	// DialTimeout bounds the connection to a backend.
 	DialTimeout = 5 * time.Second
 )
+
+// H2CWriteByteTimeout closes an h2c backend connection whose socket takes no byte while data waits
+// (ADR 0016). Fixed: it only catches a backend that stopped reading, never a silent stream.
+const H2CWriteByteTimeout = 60 * time.Second
 
 // transport is shared by every proxy handler: the backends are few and local.
 var transport = &http.Transport{
@@ -54,7 +59,7 @@ var h2cTransport = func() *http.Transport {
 		IdleConnTimeout: 90 * time.Second,
 		// Flow control keeps writes waiting on a stream, not on the socket: a socket that takes no
 		// byte for this long belongs to a frozen backend, and every stream on it is lost anyway.
-		HTTP2:     &http.HTTP2Config{WriteByteTimeout: 60 * time.Second},
+		HTTP2:     &http.HTTP2Config{WriteByteTimeout: H2CWriteByteTimeout},
 		Protocols: new(http.Protocols),
 	}
 	t.Protocols.SetUnencryptedHTTP2(true)
@@ -129,19 +134,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		e.name = "-" // the log schema's "no route"
 	}
 	timeout := progress(e.timeout)
-	rec := &recorder{ResponseWriter: w, rc: rc, timeout: timeout, status: http.StatusOK}
+	c := new(cut)
+	rec := &recorder{ResponseWriter: w, rc: rc, timeout: timeout, status: http.StatusOK, cut: c}
 	// net/http must retain its original body to detect early Close and disable keep-alive.
-	req = req.WithContext(req.Context())
+	req = req.WithContext(context.WithValue(req.Context(), cutKey{}, c))
 	var body *progressReader
 	if req.Body != nil && req.Body != http.NoBody {
-		body = &progressReader{ReadCloser: req.Body, rc: rc, timeout: timeout}
+		body = &progressReader{ReadCloser: req.Body, rc: rc, timeout: timeout, cut: c}
 		req.Body = body
 		if req.ProtoMajor == 1 {
 			rec.input = body
 		}
 	}
 	if e.h2c && req.ProtoMajor == 2 {
-		s := &h2cStream{timeout: timeout, body: body}
+		s := &h2cStream{timeout: timeout, body: body, cut: c}
 		if body != nil {
 			body.stream = s
 		}
@@ -183,6 +189,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func (r *Router) done(req *http.Request, route string, rec *recorder, start time.Time, quiet bool) {
 	d := time.Since(start)
 	r.metrics.Request(r.listener, route, req.Method, rec.status, rec.bytes, d)
+	if phase, _ := rec.cut.phase.Load().(string); phase != "" {
+		r.metrics.ProgressTimeout(route)
+		r.log.Info("", "event", "progress-timeout", "listener", r.listener, "route", route, "phase", phase)
+	}
 	if r.access && !quiet {
 		r.log.Info("",
 			"event", "request",
@@ -300,6 +310,21 @@ func hostOnly(hostport string) string {
 	return strings.ToLower(hostport)
 }
 
+// cut records which no-progress bound ended a request (ADR 0016); the first one wins. Phases:
+// client-read, client-write, backend-read, backend-write (HTTP/1.1 backend), stream (h2c stream).
+type cut struct{ phase atomic.Value }
+
+type cutKey struct{}
+
+func (c *cut) set(phase string) {
+	if c != nil {
+		c.phase.CompareAndSwap(nil, phase)
+	}
+}
+
+// timedOut tells whether err comes from a deadline genkan set.
+func timedOut(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }
+
 // progressReader bounds explicit reads and net/http's bounded discard inside Close. The transport
 // may still read or close the body after the handler returned (backend answered early): rc belongs
 // to the finished request then (HTTP/2 frees it), so mu serialises rc calls with finish.
@@ -308,6 +333,7 @@ type progressReader struct {
 	rc      *http.ResponseController
 	timeout time.Duration
 	stream  *h2cStream // set on an h2c stream: once armed, it bounds reads instead of the deadline
+	cut     *cut
 	mu      sync.Mutex
 	closed  bool
 	done    bool
@@ -329,6 +355,9 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.ReadCloser.Read(b)
 	if n > 0 {
 		p.stream.touch()
+	}
+	if timedOut(err) {
+		p.cut.set("client-read")
 	}
 	return n, err
 }
@@ -362,6 +391,7 @@ type recorder struct {
 	hijacked    bool
 	status      int
 	bytes       int64
+	cut         *cut
 }
 
 func (r *recorder) closeInput() {
@@ -371,6 +401,14 @@ func (r *recorder) closeInput() {
 }
 
 func (r *recorder) push() { r.rc.SetWriteDeadline(time.Now().Add(r.timeout)) }
+
+// wrote marks a write that failed after the whole bound: HTTP/2 reports its write deadline as a
+// reset stream, not as a deadline error.
+func (r *recorder) wrote(err error, start time.Time) {
+	if err != nil && (timedOut(err) || time.Since(start) >= r.timeout) {
+		r.cut.set("client-write")
+	}
+}
 
 func (r *recorder) WriteHeader(code int) {
 	if !r.wroteHeader && (code >= 200 || code == http.StatusSwitchingProtocols) {
@@ -387,10 +425,12 @@ func (r *recorder) Write(b []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
+	start := time.Now()
 	r.push()
 	defer r.rc.SetWriteDeadline(time.Time{})
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += int64(n)
+	r.wrote(err, start)
 	return n, err
 }
 
@@ -398,9 +438,12 @@ func (r *recorder) FlushError() error {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
+	start := time.Now()
 	r.push()
 	defer r.rc.SetWriteDeadline(time.Time{})
-	return r.rc.Flush()
+	err := r.rc.Flush()
+	r.wrote(err, start)
+	return err
 }
 
 func (r *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -425,7 +468,8 @@ func (t upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if s, ok := req.Context().Value(h2cKey{}).(*h2cStream); ok {
 		return s.roundTrip(req)
 	}
-	p := &pending{timeout: progress(t.timeout)}
+	c, _ := req.Context().Value(cutKey{}).(*cut)
+	p := &pending{timeout: progress(t.timeout), cut: c}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			info.Conn.(*upstreamConn).req.Store(p)
@@ -444,6 +488,7 @@ func (t upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 type pending struct {
 	body    atomic.Bool // its response body is being read
 	timeout time.Duration
+	cut     *cut
 }
 
 // upstreamConn measures body inactivity below HTTP buffering, on each network Read.
@@ -453,21 +498,31 @@ type upstreamConn struct {
 }
 
 func (c *upstreamConn) Read(b []byte) (int, error) {
-	if p := c.req.Load(); p != nil && p.body.Load() {
-		c.SetReadDeadline(time.Now().Add(p.timeout))
-		defer c.SetReadDeadline(time.Time{})
+	p := c.req.Load()
+	if p == nil || !p.body.Load() {
+		return c.Conn.Read(b)
 	}
-	return c.Conn.Read(b)
+	c.SetReadDeadline(time.Now().Add(p.timeout))
+	defer c.SetReadDeadline(time.Time{})
+	n, err := c.Conn.Read(b)
+	if timedOut(err) {
+		p.cut.set("backend-read")
+	}
+	return n, err
 }
 
 func (c *upstreamConn) Write(b []byte) (int, error) {
-	timeout := ProgressTimeout
-	if p := c.req.Load(); p != nil {
+	p, timeout := c.req.Load(), ProgressTimeout
+	if p != nil {
 		timeout = p.timeout
 	}
 	c.SetWriteDeadline(time.Now().Add(timeout))
 	defer c.SetWriteDeadline(time.Time{})
-	return c.Conn.Write(b)
+	n, err := c.Conn.Write(b)
+	if p != nil && timedOut(err) {
+		p.cut.set("backend-write")
+	}
+	return n, err
 }
 
 type h2cKey struct{}
@@ -478,6 +533,7 @@ type h2cKey struct{}
 type h2cStream struct {
 	timeout time.Duration
 	body    *progressReader // the client's request body; nil without one
+	cut     *cut
 	timer   atomic.Pointer[time.Timer]
 }
 
@@ -498,7 +554,10 @@ func (s *h2cStream) roundTrip(req *http.Request) (*http.Response, error) {
 		cancel()
 		return nil, err
 	}
-	s.timer.Store(time.AfterFunc(s.timeout, cancel))
+	s.timer.Store(time.AfterFunc(s.timeout, func() {
+		s.cut.set("stream")
+		cancel()
+	}))
 	if s.body != nil {
 		s.body.deadline(time.Time{}, true) // a read pending since before the headers
 	}

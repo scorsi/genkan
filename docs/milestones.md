@@ -144,7 +144,7 @@ Acceptance: unit tests for precedence rules.
 
 ### v1.3 gRPC through h2c backends
 
-Status: implemented 2026-10-31 under ADR 0016 (proposed); unit and module-unit tests green on
+Status: implemented 2026-10-31 under ADR 0016 (accepted 2026-10-31); unit and module-unit tests green on
 darwin, `vm` pending on the builder.
 
 Deliverable: the forge's gRPC (bidirectional streams included), grpc-web, git and UI behind one
@@ -156,13 +156,16 @@ TLS route to one plaintext backend port.
   per stream, either direction counting as progress. NixOS module: `sites.<host>.progressTimeout`.
 - Trailers (`grpc-status`, `grpc-message`, `grpc-status-details-bin`) relayed; `te`,
   `content-type`, `Origin` and `Host` unchanged; no request size cap.
+- A request or stream cut by the progress timeout writes `progress-timeout` (route, phase) and
+  increments `genkan_progress_timeouts_total{route}`.
 
 Acceptance: Go tests (standard library, gRPC framing by hand) for a bidirectional stream with
 interleaved messages, a silence past the default timeout and the three trailers; a server stream
 silent past the default timeout on a raised route and cut on a default one; a silent stream cut
 while a busy sibling on the same connections completes; a 64 MiB client stream; HTTP/1.1 and
 WebSocket on an h2c route; ALPN h2 and http/1.1; 100 concurrent streams with the 101st waiting
-(ADR 0014); no credential in access logs. VM test: a 65 s silent bidirectional stream with
+(ADR 0014); no credential in access logs; the `progress-timeout` line and counter for an h2c
+stream cut and an HTTP/1.1 backend cut. VM test: a 65 s silent bidirectional stream with
 trailers through the TLS listener on a route raised to 10 min.
 
 ## Proposals not in scope (need agreement before entering a milestone)

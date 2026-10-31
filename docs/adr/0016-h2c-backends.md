@@ -40,7 +40,8 @@ Before the headers, the client body keeps ADR 0007's per-read deadline with the 
 Writes to the client keep the per-write deadline (a client that stops reading a stream is cut
 after the route's timeout). On the h2c connection itself, `HTTP2Config.WriteByteTimeout = 60 s`
 closes a socket that takes no byte while data is waiting: flow control keeps a slow stream from
-blocking the socket, so this only catches a frozen backend.
+blocking the socket, so this only catches a frozen backend. It is fixed, not per route (a silent
+stream never trips it), and is one named constant next to ADR 0007's (`H2CWriteByteTimeout`).
 
 **Unchanged and now tested.** The TLS listener offers ALPN `h2` then `http/1.1`. Trailers are
 relayed (ReverseProxy announces or prefixes them; the router's response writer passes `Header`,
@@ -67,8 +68,13 @@ request budget like upstream HTTP/1.1 connections were.
 
 - Supplements ADR 0002 (two additive route keys) and ADR 0007 (one value becomes per-route; the
   h2c stream rule above). ADR 0005 is unchanged.
-- A cut h2c stream is visible in its `request` line (the status was already sent) and as a reset on
-  the client; no extra log event is written for it.
+- A request or h2c stream cut by its progress timeout, on any route and protocol, writes one info
+  `progress-timeout` line (ADR 0008 conventions, no `err` at info) with `listener`, `route` and
+  `phase`: `client-read`, `client-write`, `backend-read`, `backend-write` (HTTP/1.1 backend) or
+  `stream` (the h2c per-stream timer), and increments `genkan_progress_timeouts_total{route}` on
+  the loopback `/metrics`. Its `request` line still carries the status already sent; the client
+  sees a reset. A cut before the response started also stays an `upstream-error` with its 502.
+  Amended 2026-10-31 by the owner (it said no extra event before).
 - A backend that stops reading an upload before sending its response headers holds that stream
   until the client or the backend gives up: flow control stops the transport from reading the
   client body, so no deadline is running. Acceptable for a local backend; after the headers the
@@ -78,4 +84,5 @@ request budget like upstream HTTP/1.1 connections were.
 
 ## Status
 
-Proposed — 2026-10-31.
+Accepted — 2026-10-31 (owner decision, including "either direction counts as progress" on h2c
+streams).

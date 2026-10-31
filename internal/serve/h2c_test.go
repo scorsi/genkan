@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/scorsi/genkan/internal/config"
+	"github.com/scorsi/genkan/internal/metrics"
 	"github.com/scorsi/genkan/internal/router"
 )
 
@@ -60,7 +61,7 @@ func forgeBackend(t *testing.T, h http.HandlerFunc) string {
 
 // grpcGenkan serves two h2c routes to backend on a TLS listener: grpc.example with progress_timeout
 // raised, plain.example with the default. ProgressTimeout shrinks to 100 ms for the test.
-func grpcGenkan(t *testing.T, backend, raised string) (addr string, logs *syncBuffer) {
+func grpcGenkan(t *testing.T, backend, raised string) (addr string, logs *syncBuffer, m *metrics.Registry) {
 	t.Helper()
 	router.ProgressTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { router.ProgressTimeout = 60 * time.Second })
@@ -69,12 +70,12 @@ func grpcGenkan(t *testing.T, backend, raised string) (addr string, logs *syncBu
 	grpc.H2C, grpc.ProgressTimeout = true, raised
 	plain := route("plain", "lan", "plain.example", backend)
 	plain.H2C = true
-	_, logs, _ = newTestServer(t, &config.Config{
+	_, logs, m = newTestServer(t, &config.Config{
 		Listeners:    []config.Listener{{Name: "lan", Addr: addr, Mode: "tls"}},
 		Certificates: map[string]config.Certificate{"grpc.example": certFiles(t, "grpc.example"), "plain.example": certFiles(t, "plain.example")},
 		Routes:       []config.Route{grpc, plain},
 	})
-	return addr, logs
+	return addr, logs, m
 }
 
 // client offers ALPN h2 then http/1.1 and speaks HTTP/2 (h2), or offers and speaks only HTTP/1.1;
@@ -130,7 +131,7 @@ func TestGRPCBidiStream(t *testing.T) {
 		}
 		grpcStatus(w, "3", "bad argument")
 	})
-	addr, _ := grpcGenkan(t, backend, "400ms")
+	addr, _, _ := grpcGenkan(t, backend, "400ms")
 	pr, pw := io.Pipe()
 	defer pw.Close()
 	res := call(t, client("grpc.example", true, false), addr, "grpc.example", "/echo.Echo/Bidi", pr)
@@ -193,7 +194,7 @@ func TestH2CStreamTimeouts(t *testing.T) {
 		}
 		grpcStatus(w, "0", "")
 	})
-	addr, _ := grpcGenkan(t, backend, "400ms")
+	addr, logs, m := grpcGenkan(t, backend, "400ms")
 	stream := func(host, path string) (n int, err error) {
 		res := call(t, client(host, true, false), addr, host, path, bytes.NewReader(grpcFrame(nil)))
 		for {
@@ -213,6 +214,10 @@ func TestH2CStreamTimeouts(t *testing.T) {
 	if n, err := stream("plain.example", "/silent"); n != 1 || err == nil {
 		t.Errorf("default route: %d messages, %v; want the stream cut after 1", n, err)
 	}
+	eventually(t, "progress-timeout line and counter for the cut stream", func() bool {
+		return strings.Contains(logs.String(), `"event":"progress-timeout","listener":"lan","route":"plain","phase":"stream"`) &&
+			strings.Contains(scrape(m), `genkan_progress_timeouts_total{route="plain"} 1`+"\n")
+	})
 
 	c := client("grpc.example", true, false) // one connection to genkan, one h2c connection behind it
 	type result struct {
@@ -259,7 +264,7 @@ func TestH2CUpload64MiB(t *testing.T) {
 		w.Write(grpcFrame([]byte(fmt.Sprint(total))))
 		grpcStatus(w, "0", "")
 	})
-	addr, _ := grpcGenkan(t, backend, "10s")
+	addr, _, _ := grpcGenkan(t, backend, "10s")
 	pr, pw := io.Pipe()
 	go func() {
 		chunk := grpcFrame(make([]byte, 1<<20))
@@ -295,7 +300,7 @@ func TestH2CRouteProtocols(t *testing.T) {
 		buf.Flush()
 		io.CopyN(c, buf, 4) // echo
 	})
-	addr, _ := grpcGenkan(t, backend, "")
+	addr, _, _ := grpcGenkan(t, backend, "")
 	for _, h2 := range []bool{true, false} {
 		req, _ := http.NewRequest("GET", "https://"+addr+"/", nil)
 		req.Host = "grpc.example"
@@ -342,7 +347,7 @@ func TestH2StreamCap(t *testing.T) {
 		case <-r.Context().Done():
 		}
 	})
-	addr, _ := grpcGenkan(t, backend, "10s")
+	addr, _, _ := grpcGenkan(t, backend, "10s")
 	c := client("grpc.example", true, true)
 	var done atomic.Int32
 	start := func() {
@@ -391,7 +396,7 @@ func TestH2StreamCap(t *testing.T) {
 
 // Credentials in headers, cookies and the query string never reach the access log.
 func TestAccessLogOmitsSecrets(t *testing.T) {
-	addr, logs := grpcGenkan(t, forgeBackend(t, func(http.ResponseWriter, *http.Request) {}), "")
+	addr, logs, _ := grpcGenkan(t, forgeBackend(t, func(http.ResponseWriter, *http.Request) {}), "")
 	for _, h2 := range []bool{true, false} {
 		req, _ := http.NewRequest("GET", "https://"+addr+"/api?access_token=secret-query&token=secret-token", nil)
 		req.Host = "grpc.example"
